@@ -235,6 +235,9 @@ def save_model(model, model_params, models_path, model_name, epoch=-1):
         path = network_path + '/' + str(epoch)
         params_path = network_path + '/parameters_'+str(epoch)
 
+    #path =  path + '.pth'
+    #params_path = params_path + '.pth'
+
     torch.save(model.state_dict(), path)
 
     if model_params is not None:

@@ -14,6 +14,8 @@ import network_architectures as arcs
 
 from architectures.CNNs.VGG import VGG
 
+
+
 def train(models_path, untrained_models, sdn=False, ic_only_sdn=False, device='cpu'):
     print('Training models...')
 
@@ -87,7 +89,7 @@ def train_sdns(models_path, networks, ic_only=False, device='cpu'):
 
 
 def train_models(models_path, device='cpu'):
-    tasks = ['cifar10', 'cifar100', 'tinyimagenet']
+    tasks = ['cifar10', 'cifar100'] #, 'tinyimagenet'
 
     cnns = []
     sdns = []

@@ -83,12 +83,12 @@ class TinyImagenet():
         print('Loading TinyImageNet...')
         self.batch_size = batch_size
         self.img_size = 64
-        self.num_classes = 200
+        self.num_classes = 100
         self.num_test = 10000
         self.num_train = 100000
         
-        train_dir = 'data/tiny-imagenet-200/train'
-        valid_dir = 'data/tiny-imagenet-200/val/images'
+        train_dir = '/home/tangjie.zhang/dataset/imagenet100/train'
+        valid_dir = '/home/tangjie.zhang/dataset/imagenet100/val'
 
         normalize = transforms.Normalize(mean=[0.4802,  0.4481,  0.3975], std=[0.2302, 0.2265, 0.2262])
         
@@ -159,7 +159,9 @@ def accuracy(output, target, topk=(1,)):
 
         res = []
         for k in topk:
-            correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
+            #modified in 2025.9.25
+            #correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
             res.append(correct_k.mul_(100.0 / batch_size))
     return res
 

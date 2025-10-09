@@ -22,7 +22,8 @@ def early_exit_experiments(models_path, device='cpu'):
 
     #sdn_names = ['vgg16bn_sdn', 'resnet56_sdn', 'wideresnet32_4_sdn', 'mobilenet_sdn']; add_trigger = False
     
-    sdn_names = ['vgg16bn_sdn']; add_trigger = False
+    #sdn_names = ['vgg16bn_sdn']; add_trigger = False
+    sdn_names = ['resnet56_sdn']; add_trigger = False
     sdn_names = [task + '_' + sdn_name + '_' + sdn_training_type for sdn_name in sdn_names]
 
     
