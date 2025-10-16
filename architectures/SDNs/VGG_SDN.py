@@ -38,22 +38,22 @@ class ConvBlockWOutput(nn.Module):
 
 
         if add_output:
-            self.output = af.InternalClassifier(input_size, output_channels, num_classes) 
+            self.output = af.InternalClassifier(input_size, output_channels, num_classes)
             self.no_output = False
-
         else:
-            self.output = nn.Sequential()
-            self.forward = self.only_forward
+            self.output = None
             self.no_output = True
         
 
     def forward(self, x):
         fwd = self.layers(x)
+        if self.no_output or self.output is None:
+            return fwd, 0, None
         return fwd, 1, self.output(fwd)
 
     def only_output(self, x):
         fwd = self.layers(x)
-        return self.output(fwd)
+        return None if (self.no_output or self.output is None) else self.output(fwd)
 
     def only_forward(self, x):
         fwd = self.layers(x)
@@ -84,17 +84,18 @@ class FcBlockWOutput(nn.Module):
             self.output = nn.Linear(output_size, num_classes)
             self.no_output = False
         else:
-            self.output = nn.Sequential()
-            self.forward = self.only_forward
+            self.output = None
             self.no_output = True
 
     def forward(self, x):
         fwd = self.layers(x)
+        if self.no_output or self.output is None:
+            return fwd, 0, None
         return fwd, 1, self.output(fwd)
 
     def only_output(self, x):
         fwd = self.layers(x)
-        return self.output(fwd)
+        return None if (self.no_output or self.output is None) else self.output(fwd)
 
     def only_forward(self, x):
         return self.layers(x), 0, None
@@ -118,6 +119,8 @@ class VGG_SDN(nn.Module):
         self.train_func = mf.sdn_train
         self.test_func = mf.sdn_test
         self.num_output = sum(self.add_output) + 1
+        # 标记是否处于 IC-only 训练阶段；默认 False，train_networks.py 在需要时会设置 True
+        self.ic_only = False
 
         self.init_conv = nn.Sequential() # just for compatibility with other models
         self.layers = nn.ModuleList()

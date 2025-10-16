@@ -44,30 +44,31 @@ class BasicBlockWOutput(nn.Module):
         self.layers = layers
 
         if add_output:
-            self.output = af.InternalClassifier(input_size, self.expansion*channels, num_classes) 
+            self.output = af.InternalClassifier(input_size, self.expansion*channels, num_classes)
             self.no_output = False
-
         else:
             self.output = None
-            self.forward = self.only_forward
             self.no_output = True
             
     def forward(self, x):
-        fwd = self.layers[0](x) # conv layers
-        fwd = fwd + self.layers[1](x) # shortcut
-        return self.layers[2](fwd), 1, self.output(fwd)         # output layers for this module
+        fwd = self.layers[0](x)
+        fwd = fwd + self.layers[1](x)
+        fwd = self.layers[2](fwd)
+        if self.no_output or self.output is None:
+            return fwd, 0, None
+        return fwd, 1, self.output(fwd)
     
     def only_output(self, x):
-        fwd = self.layers[0](x) # conv layers
-        fwd = fwd + self.layers[1](x) # shortcut
-        fwd = self.layers[2](fwd) # activation
-        out = self.output(fwd)         # output layers for this module
-        return out
-    
+        # kept for backward compatibility; assumes output exists
+        fwd = self.layers[0](x)
+        fwd = fwd + self.layers[1](x)
+        fwd = self.layers[2](fwd)
+        return None if (self.no_output or self.output is None) else self.output(fwd)
     def only_forward(self, x):
-        fwd = self.layers[0](x) # conv layers
-        fwd = fwd + self.layers[1](x) # shortcut
-        return self.layers[2](fwd), 0, None # activation
+        fwd = self.layers[0](x)
+        fwd = fwd + self.layers[1](x)
+        fwd = self.layers[2](fwd)
+        return fwd, 0, None
 
 class ResNet_SDN(nn.Module):
     def __init__(self, params):
@@ -84,6 +85,8 @@ class ResNet_SDN(nn.Module):
         self.in_channels = 16
         self.num_output = sum(self.add_output) + 1
         self.test_func = mf.sdn_test
+        # 默认非 IC-only 模式；train_networks 在需要时会切换
+        self.ic_only = False
 
         self.init_depth = 1
         self.end_depth = 1

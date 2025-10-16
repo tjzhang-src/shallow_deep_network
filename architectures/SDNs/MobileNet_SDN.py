@@ -32,19 +32,19 @@ class BlockWOutput(nn.Module):
         if add_output:
             self.output = af.InternalClassifier(input_size, out_channels, num_classes)
             self.no_output = False
-        
         else:
-            self.forward = self.only_forward
-            self.output = nn.Sequential()
+            self.output = None
             self.no_output = True
 
     def forward(self, x):
         fwd = self.layers(x)
+        if self.no_output or self.output is None:
+            return fwd, 0, None
         return fwd, 1, self.output(fwd)
         
     def only_output(self, x):
         fwd = self.layers(x)
-        return self.output(fwd)
+        return None if (self.no_output or self.output is None) else self.output(fwd)
 
     def only_forward(self, x):
         return self.layers(x), 0, None
@@ -63,6 +63,8 @@ class MobileNet_SDN(nn.Module):
         self.num_output = sum(self.add_output) + 1
         self.in_channels = 32
         self.cur_input_size = self.input_size
+        # 标记是否处于 IC-only 训练
+        self.ic_only = False
 
         self.init_depth = 1
         self.end_depth = 1

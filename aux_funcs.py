@@ -121,7 +121,7 @@ class InternalClassifier(nn.Module):
 
 
 def get_random_seed():
-    return 4221 # 121 and 1221
+    return 3221 # 121 and 1221
 
 def get_subsets(input_list, sset_size):
     return list(it.combinations(input_list, sset_size))
@@ -263,7 +263,7 @@ def get_pytorch_device():
     cuda = torch.cuda.is_available()
     print('Using PyTorch version:', torch.__version__, 'CUDA:', cuda)
     if cuda:
-        device = 'cuda:2'
+        device = 'cuda:4'
     return device
 
 

@@ -38,18 +38,18 @@ class wide_basic(nn.Module):
         self.layers.append(shortcut)
 
         if add_output:
-            self.output = af.InternalClassifier(input_size, channels, num_classes) 
+            self.output = af.InternalClassifier(input_size, channels, num_classes)
             self.no_output = False
         else:
             self.output = None
-            self.forward = self.only_forward
             self.no_output = True
 
     def only_output(self, x):
         fwd = self.layers[0](x)
         fwd = fwd + self.layers[1](x)
-        out = self.output(fwd)
-        return out
+        if self.no_output or self.output is None:
+            return None
+        return self.output(fwd)
     
     def only_forward(self, x):
         fwd = self.layers[0](x)
@@ -59,6 +59,8 @@ class wide_basic(nn.Module):
     def forward(self, x):
         fwd = self.layers[0](x)
         fwd = fwd + self.layers[1](x)
+        if self.no_output or self.output is None:
+            return fwd, 0, None
         return fwd, 1, self.output(fwd)
 
 class WideResNet_SDN(nn.Module):
@@ -77,6 +79,8 @@ class WideResNet_SDN(nn.Module):
         self.test_func = mf.sdn_test
         self.in_channels = 16
         self.num_output = sum(self.add_output) + 1
+        # 标记是否处于 IC-only 训练
+        self.ic_only = False
 
         self.init_depth = 1
         self.end_depth = 1

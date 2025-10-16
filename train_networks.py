@@ -100,7 +100,7 @@ def train_models(models_path, device='cpu'):
         af.extend_lists(cnns, sdns, arcs.create_wideresnet32_4(models_path, task, save_type='cd'))
         af.extend_lists(cnns, sdns, arcs.create_mobilenet(models_path, task, save_type='cd'))
 
-    train(models_path, cnns, sdn=False, device=device)
+    #train(models_path, cnns, sdn=False, device=device)
     train_sdns(models_path, sdns, ic_only=True, device=device) # train SDNs with IC-only strategy
     train_sdns(models_path, sdns, ic_only=False, device=device) # train SDNs with SDN-training strategy
 
@@ -136,7 +136,7 @@ def main():
     af.set_logger('outputs/train_models'.format(af.get_random_seed()))
 
     train_models(models_path, device)
-    sdn_ic_only_backdoored(device)
+    #sdn_ic_only_backdoored(device)
 
 if __name__ == '__main__':
     main()
