@@ -38,6 +38,8 @@ from typing import List, Tuple, Optional
 
 import torch
 import torch.nn.functional as F
+import torch.optim as optim
+from torch.optim.sgd import SGD
 # torchvision 的直接加载已被项目自带的标准化数据加载替代
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
@@ -86,7 +88,23 @@ def normalized_entropy_from_logits(logits):
     return ent / denom
 
 
-def select_exits(outputs: List[torch.Tensor], thresholds: List[float], force_exit_id: Optional[int] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+def get_norm_stats_for_task(task: str) -> Tuple[List[float], List[float]]:
+    """Return per-channel mean and std used during training for a given task.
+    These must match the Normalize() used in data.py.
+    """
+    t = task.lower()
+    if t == 'cifar10':
+        # Matches data.CIFAR10 normalization
+        return [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+    if t == 'cifar100':
+        return [0.507, 0.487, 0.441], [0.267, 0.256, 0.276]
+    if t == 'tinyimagenet':
+        return [0.4802, 0.4481, 0.3975], [0.2302, 0.2265, 0.2262]
+    # Fallback to identity (no normalization)
+    return [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]
+
+
+def select_exits(outputs: List[torch.Tensor], thresholds: List[float]) -> Tuple[torch.Tensor, torch.Tensor]:
     """依据 entropy 阈值列表决定早退出口。
     outputs: [ic_0, ..., ic_{N-2}, final]
     thresholds: len == N-1 (内部 IC 个数)
@@ -95,12 +113,7 @@ def select_exits(outputs: List[torch.Tensor], thresholds: List[float], force_exi
     num_internal = len(outputs) - 1
     final_idx = len(outputs)  # 1-based id
     batch = outputs[0].size(0)
-    # 若强制出口，直接返回该出口的预测
-    if force_exit_id is not None and 1 <= force_exit_id <= final_idx:
-        forced_logits = outputs[force_exit_id - 1]
-        preds = forced_logits.argmax(dim=1)
-        exit_ids = torch.full((batch,), force_exit_id, dtype=torch.long, device=forced_logits.device)
-        return preds.cpu(), exit_ids.cpu()
+    # 不进行强制选择，由阈值决定
     # 计算所有内部 IC 的 normalized entropy
     entropies = [normalized_entropy_from_logits(logits) for logits in outputs[:-1]]
     # 默认全部走到 final（放到与输出相同的设备上）
@@ -117,9 +130,18 @@ def select_exits(outputs: List[torch.Tensor], thresholds: List[float], force_exi
     return preds.cpu(), exit_ids.cpu()
 
 
-def attack_batch(model, x, y, thresholds, eps, alpha, steps, lambda_exits, lambda_ce, lambda_l2,
+def attack_batch(model, x, y, thresholds, eps, alpha, steps, lambda_exits, lambda_earlyexits, lambda_ce, lambda_l2,
                  cw=True, c=0.15, kappa=5, pcgrad=False, same_acc_early_loss=False,
-                 force_exit_id: Optional[int] = None):
+                 prefer_exit_id: Optional[int] = None,
+                 norm_mean: Optional[List[float]] = None,
+                 norm_std: Optional[List[float]] = None,
+                 gradnorm: bool = False,
+                 gradnorm_alpha: float = 1.0,
+                 gradnorm_lr: float = 1e-3,
+                 pcgrad_mode: str = 'symmetric',
+                 pcgrad_partial: float = 1.0,
+                 pre_target_margin: float = 0.0,
+                 pre_target_weight: float = 1.0):
     """对 batch 做 constrained PGD，返回 (x_adv, linf, l2, preds_adv, exits_adv, pcgrad_conflict_count)
 
     仅对原本被正确分类的样本调用。兼容 SDN（多出口）与 CNN（单出口）。
@@ -129,6 +151,24 @@ def attack_batch(model, x, y, thresholds, eps, alpha, steps, lambda_exits, lambd
     delta = torch.zeros_like(x, device=x.device, requires_grad=True)
     num_internal = model.num_output - 1 if hasattr(model, 'num_output') else 0
 
+    # Prepare normalization-aware bounds and step sizes (operate in normalized space)
+    if norm_mean is None or norm_std is None:
+        # Assume inputs are already in [0,1] without normalization
+        lower = torch.zeros((1, x.size(1), 1, 1), device=x.device)
+        upper = torch.ones((1, x.size(1), 1, 1), device=x.device)
+        # eps/alpha already in pixel unit; when no normalization, keep as scalars
+        eps_tensor = torch.full_like(x, fill_value=eps)
+        alpha_tensor = torch.full_like(x, fill_value=alpha)
+    else:
+        mean = torch.tensor(norm_mean, device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
+        std = torch.tensor(norm_std, device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
+        # Valid range in normalized space for pixel range [0,1]
+        lower = (0.0 - mean) / std
+        upper = (1.0 - mean) / std
+        # Map pixel-space eps/alpha to normalized space per channel
+        eps_tensor = torch.ones_like(x) * (eps / std)
+        alpha_tensor = torch.ones_like(x) * (alpha / std)
+
     # 若 lambda_exits 长度不足，补齐；超出截断
     if len(lambda_exits) < num_internal:
         lambda_exits = lambda_exits + [lambda_exits[-1]] * (num_internal - len(lambda_exits))
@@ -136,8 +176,21 @@ def attack_batch(model, x, y, thresholds, eps, alpha, steps, lambda_exits, lambd
         lambda_exits = lambda_exits[:num_internal]
 
     conflict_steps = 0
+
+    # GradNorm state (for two tasks: accuracy and early-exit). Initialize on demand
+    use_two_tasks = False
+    if (lambda_earlyexits > 0.0) and (len(lambda_exits) > 0) and (len(lambda_exits) == (model.num_output - 1 if hasattr(model, 'num_output') else 0)):
+        use_two_tasks = True
+    if gradnorm and not use_two_tasks:
+        # No early-exit loss -> GradNorm degenerates to single task; disable
+        gradnorm = False
+    # holders
+    w = None
+    opt_w = None
+    initial_losses = None
     for _ in range(steps):
-        x_adv = (x_orig + delta).clamp(0.0, 1.0)
+        # Compose adversarial example in normalized space and clamp to valid normalized bounds
+        x_adv = (x_orig + delta).clamp(lower, upper)
         outputs = model.forward(x_adv)
         if isinstance(outputs, list):
             internal_outputs = outputs[:-1]
@@ -153,11 +206,11 @@ def attack_batch(model, x, y, thresholds, eps, alpha, steps, lambda_exits, lambd
                 coef = 0.1 if i == 0 else 0.05
                 early_losses.append(-F.cross_entropy(logits, y) * coef)
         else:
-            # 若指定强制出口，则将早期损失设置为：
+            # 若指定偏好出口，则将早期损失设置为：
             # - 对于 i < target: 提高熵，避免更早出口 -> hinge(t - nent, 0)
             # - 对于 i == target: 降低熵，触发该出口 -> hinge(nent - t, 0)
             # - 对于 i > target: 不约束（已不会到达）
-            target = force_exit_id if (force_exit_id is not None and force_exit_id >= 1) else None
+            target = prefer_exit_id if (prefer_exit_id is not None and prefer_exit_id >= 1) else None
             for i, logits in enumerate(internal_outputs):
                 nent = normalized_entropy_from_logits(logits)
                 t = thresholds[i] if i < len(thresholds) else (thresholds[-1] if len(thresholds) > 0 else 0.0)
@@ -170,20 +223,22 @@ def attack_batch(model, x, y, thresholds, eps, alpha, steps, lambda_exits, lambd
                         # 强制最终出口：对所有内部出口都避免早退
                         early_losses.append(torch.clamp(t - nent, min=0.0).mean())
                     elif exit_idx < target:
-                        early_losses.append(torch.clamp(t - nent, min=0.0).mean())
+                        # 在目标之前的层，稍微“抬高”阈值为 (t + pre_target_margin)，并可调节权重
+                        early_losses.append(pre_target_weight * torch.clamp((t + float(pre_target_margin)) - nent, min=0.0).mean())
                     elif exit_idx == target:
                         early_losses.append(torch.clamp(nent - t, min=0.0).mean())
                     else:
                         # exit_idx > target: 无约束
                         early_losses.append(torch.zeros(1, device=final_out.device, dtype=final_out.dtype))
         if early_losses:
-            loss_early_total = sum(w * l for w, l in zip(lambda_exits, early_losses))
+            # Avoid colliding with GradNorm weight variable name
+            loss_early_total = sum(w_exit * l for w_exit, l in zip(lambda_exits, early_losses))
             if not isinstance(loss_early_total, torch.Tensor):
                 loss_early_total = torch.tensor(loss_early_total, device=final_out.device, dtype=final_out.dtype)
         else:
             loss_early_total = torch.zeros(1, device=final_out.device, dtype=final_out.dtype)
 
-        # 最终输出保持正确 (CW 或 CE)
+    # 最终输出保持正确 (CW 或 CE)
         if cw:
             batch_indices = torch.arange(batch_size, device=final_out.device)
             target_logit = final_out[batch_indices, y]
@@ -198,32 +253,104 @@ def attack_batch(model, x, y, thresholds, eps, alpha, steps, lambda_exits, lambd
 
         if pcgrad and early_losses:
             g_acc = torch.autograd.grad(loss_ce_term * lambda_ce, delta, retain_graph=True)[0]
-            g_early = torch.autograd.grad(loss_early_total, delta, retain_graph=True)[0]
+            g_early = torch.autograd.grad(loss_early_total * lambda_earlyexits, delta, retain_graph=True)[0]
             g_reg = torch.autograd.grad(lambda_l2 * loss_l2_term, delta)[0]
-            if torch.dot(g_acc.flatten(), g_early.flatten()) < 0:
-                g_acc = g_acc - (torch.dot(g_acc.flatten(), g_early.flatten()) / (g_early.flatten().norm() ** 2 + 1e-12)) * g_early
+            dot = torch.dot(g_acc.flatten(), g_early.flatten())
+            if dot < 0:
                 conflict_steps += 1
+                # Partial or full projection controlled by pcgrad_partial
+                denom_e = (g_early.flatten().norm() ** 2 + 1e-12)
+                denom_a = (g_acc.flatten().norm() ** 2 + 1e-12)
+                proj_acc = g_acc - pcgrad_partial * (dot / denom_e) * g_early
+                if pcgrad_mode == 'symmetric':
+                    proj_early = g_early - pcgrad_partial * (dot / denom_a) * g_acc
+                else:
+                    proj_early = g_early
+                g_acc, g_early = proj_acc, proj_early
             grads = g_acc + g_early + g_reg
+        elif gradnorm and early_losses:
+            # lazy init for GradNorm weights/optimizer
+            if w is None:
+                w = torch.nn.Parameter(torch.ones(2, device=x.device))
+                opt_w = SGD([w], lr=float(gradnorm_lr))
+            # Two-task GradNorm between accuracy and early-exit losses
+            loss_acc_scaled = lambda_ce * loss_ce_term
+            loss_early_scaled = lambda_earlyexits * loss_early_total
+
+            # Initialize initial losses at first step (detach to avoid graph retention)
+            if initial_losses is None:
+                with torch.no_grad():
+                    l0_acc = float(loss_acc_scaled.item()) if loss_acc_scaled.requires_grad else float(loss_acc_scaled)
+                    l0_early = float(loss_early_scaled.item()) if loss_early_scaled.requires_grad else float(loss_early_scaled)
+                    # avoid zeros
+                    if l0_acc <= 0.0:
+                        l0_acc = 1e-4
+                    if l0_early <= 0.0:
+                        l0_early = 1e-4
+                    initial_losses = torch.tensor([l0_acc, l0_early], device=x.device)
+
+            # 1) Weighted total loss for delta update (do not update w here)
+            L_total = w[0] * loss_acc_scaled + w[1] * loss_early_scaled + lambda_l2 * loss_l2_term
+            grads = torch.autograd.grad(L_total, delta, retain_graph=True)[0]
+
+            # 2) Grad norms per task on shared param (delta)
+            G = torch.zeros(2, device=x.device)
+            g_acc = torch.autograd.grad(w[0] * loss_acc_scaled, delta, retain_graph=True, create_graph=True)[0]
+            g_early = torch.autograd.grad(w[1] * loss_early_scaled, delta, retain_graph=True, create_graph=True)[0]
+            G[0] = g_acc.view(-1).norm(p=2)
+            G[1] = g_early.view(-1).norm(p=2)
+            G_bar = G.mean()
+
+            # 3) Relative inverse training rates r_i
+            with torch.no_grad():
+                L_t = torch.tensor([
+                    float(loss_acc_scaled.item()),
+                    float(loss_early_scaled.item())
+                ], device=x.device)
+                L0 = initial_losses
+                Ltilde = L_t / L0
+                r = Ltilde / Ltilde.mean()
+
+            # 4) Target gradient norms
+            G_star = G_bar * (r ** float(gradnorm_alpha))
+
+            # 5) GradNorm loss and update w
+            grad_loss = (G - G_star).abs().sum()
+            assert opt_w is not None
+            opt_w.zero_grad()
+            grad_loss.backward()
+            opt_w.step()
+
+            # 6) Normalize w to keep sum(w)=T and positive
+            with torch.no_grad():
+                w.data = torch.clamp(w.data, min=1e-4)
+                w.data = (2.0 * w.data) / w.data.sum()
         else:
-            total_loss = loss_early_total + lambda_ce * loss_ce_term + lambda_l2 * loss_l2_term
+            total_loss = loss_early_total * lambda_earlyexits + lambda_ce * loss_ce_term + lambda_l2 * loss_l2_term
             grads = torch.autograd.grad(total_loss, delta, retain_graph=False)[0]
 
-        # PGD 更新（最小化 loss）
-        delta.data = delta.data - alpha * grads.sign()
-        delta.data = torch.clamp(delta.data, -eps, eps)
-        delta.data = torch.clamp(x_orig + delta.data, 0.0, 1.0) - x_orig
+        # PGD 更新（最小化 loss），在归一化空间按通道尺度更新与投影
+        delta.data = delta.data - alpha_tensor * grads.sign()
+        delta.data = torch.max(torch.min(delta.data, eps_tensor), -eps_tensor)
+        delta.data = (x_orig + delta.data).clamp(lower, upper) - x_orig
         delta.grad = None
 
-    x_adv = (x_orig + delta).clamp(0.0, 1.0)
+    x_adv = (x_orig + delta).clamp(lower, upper)
     with torch.no_grad():
         adv_outputs = model.forward(x_adv)
         if isinstance(adv_outputs, list):
-            preds_adv, exits_adv = select_exits(adv_outputs, thresholds, force_exit_id=force_exit_id)
+            preds_adv, exits_adv = select_exits(adv_outputs, thresholds)
         else:
             preds_adv = adv_outputs.argmax(dim=1).cpu()
             exits_adv = torch.full((batch_size,), 1, dtype=torch.long)
-        linf = delta.abs().view(batch_size, -1).max(dim=1)[0].cpu()
-        l2 = delta.view(batch_size, -1).norm(p=2, dim=1).cpu()
+        # Report norms in pixel space for interpretability
+        if norm_std is not None:
+            std = torch.tensor(norm_std, device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
+            delta_pix = delta * std
+        else:
+            delta_pix = delta
+        linf = delta_pix.abs().view(batch_size, -1).max(dim=1)[0].cpu()
+        l2 = delta_pix.view(batch_size, -1).norm(p=2, dim=1).cpu()
     return x_adv.detach(), linf, l2, preds_adv, exits_adv, int(conflict_steps / max(1, steps))
 
 def list_candidate_model_names(models_path: str) -> List[str]:
@@ -303,6 +430,8 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
 
     eps = parse_float_expr(args.eps)
     alpha = parse_float_expr(args.alpha)
+    # Normalization stats for correct clamping in normalized space
+    mean, std = get_norm_stats_for_task(task)
 
     # 主循环
     total = 0
@@ -324,7 +453,7 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
         with torch.no_grad():
             outputs_clean = model.forward(imgs)
             if num_internal > 0:
-                preds_clean, exits_clean = select_exits(outputs_clean, entropy_thresholds, force_exit_id=args.force_exit)
+                preds_clean, exits_clean = select_exits(outputs_clean, entropy_thresholds)
             else:
                 preds_clean = outputs_clean[-1].argmax(dim=1).cpu() if isinstance(outputs_clean, list) else outputs_clean.argmax(dim=1).cpu()
                 exits_clean = torch.full((batch_size,), 1, dtype=torch.long)
@@ -352,10 +481,14 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
         x_adv_subset, linf_vals, l2_vals, preds_adv_subset, exits_adv_subset, conflict_flag = attack_batch(
             model, imgs_correct, labels_correct,
             entropy_thresholds, eps, alpha, args.pgd_steps,
-            lambda_exits, args.lambda_ce, args.lambda_l2,
+            lambda_exits,args.lambda_earlyexits, args.lambda_ce, args.lambda_l2,
             cw=args.cw, c=args.c, kappa=args.kappa, pcgrad=args.pcgrad,
             same_acc_early_loss=args.same_acc_early_loss_value,
-            force_exit_id=args.force_exit
+            prefer_exit_id=args.prefer_exit,
+            norm_mean=mean, norm_std=std,
+            gradnorm=args.gradnorm, gradnorm_alpha=args.gradnorm_alpha, gradnorm_lr=args.gradnorm_lr,
+            pcgrad_mode=args.pcgrad_mode, pcgrad_partial=args.pcgrad_partial,
+            pre_target_margin=args.pre_target_margin, pre_target_weight=args.pre_target_weight
         )
         if conflict_flag:
             pc_conflict_fraction += batch_size
@@ -365,7 +498,7 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
         with torch.no_grad():
             outputs_adv = model.forward(imgs_adv)
             if num_internal > 0:
-                preds_adv_batch, exits_adv_batch = select_exits(outputs_adv, entropy_thresholds, force_exit_id=args.force_exit)
+                preds_adv_batch, exits_adv_batch = select_exits(outputs_adv, entropy_thresholds)
             else:
                 preds_adv_batch = outputs_adv[-1].argmax(dim=1).cpu() if isinstance(outputs_adv, list) else outputs_adv.argmax(dim=1).cpu()
                 exits_adv_batch = torch.full((batch_size,), 1, dtype=torch.long)
@@ -386,6 +519,15 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
     adv_value = sum(cnt * i for i, cnt in enumerate(exit_counts_adv) if i > 0)
     dist_clean = exit_counts_clean[1 : num_internal + 2]
     dist_adv = exit_counts_adv[1 : num_internal + 2]
+    # Sanity checks for exit distribution counts
+    clean_sum = int(sum(dist_clean))
+    adv_sum = int(sum(dist_adv))
+    try:
+        dataset_len = len(testloader.dataset)  # type: ignore[attr-defined]
+    except Exception:
+        dataset_len = total
+    if clean_sum != total or adv_sum != total or total != dataset_len:
+        print(f"[WARN] Exit counts mismatch: clean_sum={clean_sum}, adv_sum={adv_sum}, total_iter={total}, dataset_len={dataset_len}")
     rec = {
         'model_name': model_name,
         'task': params.get('task', 'unknown'),
@@ -406,7 +548,8 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
         'thresholds': entropy_thresholds,
         'lambda_exits': lambda_exits,
         'pcgrad_conflict_frac': pc_conflict_fraction / max(1, total),
-        'forced_exit': int(args.force_exit) if args.force_exit is not None else None,
+        'preferred_exit': int(args.prefer_exit) if args.prefer_exit is not None else None,
+        'gradnorm': bool(args.gradnorm),
     }
     if str(device).startswith('cuda'):
         del model
@@ -423,7 +566,7 @@ def save_attack_summary(records: List[dict], out_dir='outputs/test_results'):
     fields = [
         'model_name','task','num_exits','eps','alpha','pgd_steps','cw','pcgrad',
         'clean_final_acc','adv_final_acc','avg_exit_clean','avg_exit_adv','avg_linf','avg_l2',
-        'thresholds','lambda_exits','exit_dist_clean','exit_dist_adv','pcgrad_conflict_frac','forced_exit'
+        'thresholds','lambda_exits','exit_dist_clean','exit_dist_adv','pcgrad_conflict_frac','preferred_exit','gradnorm'
     ]
     with open(csv_path, 'w', newline='') as f:
         wr = csv.DictWriter(f, fieldnames=fields)
@@ -453,24 +596,25 @@ def save_attack_summary(records: List[dict], out_dir='outputs/test_results'):
             f.write(f"  - Norms (Linf/L2): {r['avg_linf']:.6f} / {r['avg_l2']:.6f}\n")
             ths = r.get('thresholds', [])
             f.write(f"  - Thresholds: {','.join(f'{x:.2f}' for x in ths) if ths else '-'}\n\n")
-            fe = r.get('forced_exit', None)
-            if fe is not None:
-                f.write(f"  - Forced exit: {fe}\n\n")
+            pe = r.get('preferred_exit', None)
+            if pe is not None:
+                f.write(f"  - Preferred exit: {pe}\n\n")
 
     print(f"Saved summary:\n- {csv_path}\n- {md_path}")
 
 
 def main():
     parser = argparse.ArgumentParser(description='PGD Attack for SDN Models')
-    parser.add_argument('--models_path', type=str, default='networks/3221', help='路径: 存放训练模型的根目录')
+    parser.add_argument('--models_path', type=str, default='networks/4221', help='路径: 存放训练模型的根目录')
     parser.add_argument('--model_name', type=str, default=None, help='单模型名；为空则批量评测 models_path 下所有可加载模型')
     parser.add_argument('--dataset', type=str, default='cifar10', choices=['cifar10', 'cifar100', 'tinyimagenet'], help='数据集名称')
     parser.add_argument('--data_root', type=str, default='./data', help='数据集根目录')
     parser.add_argument('--batch_size', type=int, default=128)
-    parser.add_argument('--num_workers', type=int, default=4)
-    parser.add_argument('--entropy_thresholds', type=str, default='0.70,0.80,0.90,0.95', help='逗号分隔，对应每个内部出口')
-    parser.add_argument('--lambda_exits', type=str, default=None, help='逗号分隔，对应各内部出口权重；缺省=全部1.0')
-    parser.add_argument('--lambda_ce', type=float, default=0.5)
+    parser.add_argument('--num_workers', type=int, default=8)
+    parser.add_argument('--entropy_thresholds', type=str, default='0.20,0.20,0.30,0.3,0.35,0.35', help='逗号分隔，对应每个内部出口')
+    parser.add_argument('--lambda_exits', type=str, default="1,0.9,0.8,0.7,0.6,0.5,0.4", help='逗号分隔，对应各内部出口权重；缺省=全部1.0')
+    parser.add_argument('--lambda_earlyexits', type=float, default=1.0)
+    parser.add_argument('--lambda_ce', type=float, default=1.0)
     parser.add_argument('--lambda_l2', type=float, default=0.01)
     parser.add_argument('--eps', type=str, default='8/255')
     parser.add_argument('--alpha', type=str, default='2/255')
@@ -479,12 +623,19 @@ def main():
     parser.add_argument('--c', type=float, default=0.55, help='CW 系数 c')
     parser.add_argument('--kappa', type=float, default=5.0, help='CW 置信度 margin')
     parser.add_argument('--pcgrad', action='store_true', help='是否使用 PCGrad', default=True)
-    parser.add_argument('--same_acc_early_loss_value', action='store_true', help='使用和原始示例相似的早期分支负交叉熵法')
-    parser.add_argument('--device', type=str, default='cuda:0', help='手动指定设备，如 cuda:0')
+    parser.add_argument('--pcgrad_mode', type=str, choices=['one-sided','symmetric'], default='symmetric', help='PCGrad 投影方式：单边/对称')
+    parser.add_argument('--pcgrad_partial', type=float, default=1.0, help='PCGrad 投影强度比例 [0,1]，1为完全投影')
+    parser.add_argument('--gradnorm', action='store_true', help='是否使用 GradNorm 解决多目标梯度冲突', default=False)
+    parser.add_argument('--gradnorm_alpha', type=float, default=1.0, help='GradNorm 的 alpha 超参数')
+    parser.add_argument('--gradnorm_lr', type=float, default=1e-3, help='GradNorm 中对权重 w 的学习率')
+    parser.add_argument('--same_acc_early_loss_value', default=False, action='store_true', help='使用和原始示例相似的早期分支负交叉熵法')
+    parser.add_argument('--device', type=str, default='cuda:2', help='手动指定设备，如 cuda:0')
     parser.add_argument('--only', nargs='*', help='仅评测这些模型名（可多个）')
     parser.add_argument('--skip', nargs='*', default=[], help='跳过这些模型名')
-    parser.add_argument('--skip_contains', nargs='*', default=["cnn", "training"], help='排除名字中包含这些子串的模型（多值 OR）')
-    parser.add_argument('--force_exit', type=int, default=None, help='强制模型在指定出口做决策（1..N；N为最终出口）')
+    parser.add_argument('--skip_contains', nargs='*', default=["cnn","cifar100","cifar10"], help='排除名字中包含这些子串的模型（多值 OR）')
+    parser.add_argument('--pre_target_margin', type=float, default=0.0, help='在目标出口之前的层，额外增加的熵阈值裕量 (默认0不启用)')
+    parser.add_argument('--pre_target_weight', type=float, default=1.0, help='目标之前层的约束权重(乘子)')
+    parser.add_argument('--prefer_exit', type=int, default=7, help='攻击时倾向让样本在该出口退出（1..N；N为最终出口）')
     parser.add_argument('--out_dir', type=str, default='outputs/test_results', help='导出结果目录')
     args = parser.parse_args()
 

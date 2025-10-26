@@ -21,9 +21,11 @@ import matplotlib.pyplot as plt
 plt.rcParams.update({'font.size': 13})
 
 from bisect import bisect_right
-from torch.optim import SGD, Adam
+from torch.optim.sgd import SGD
+from torch.optim.adam import Adam
 from torch.optim.lr_scheduler import _LRScheduler
 from torch.nn import CrossEntropyLoss
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.autograd import Variable
 
 import model_funcs as mf
@@ -32,6 +34,12 @@ import network_architectures as arcs
 from profiler import profile, profile_sdn
 
 from data import CIFAR10, CIFAR100, TinyImagenet
+from typing import Optional
+
+# Global custom seed (overrides default if set)
+_CUSTOM_SEED: int = None  # type: ignore[assignment]
+# Global label smoothing for CE loss
+_LABEL_SMOOTHING: float = 0.0
 
 # to log the output of the experiments to a file
 class Logger(object):
@@ -121,15 +129,33 @@ class InternalClassifier(nn.Module):
 
 
 def get_random_seed():
-    return 3221 # 121 and 1221
+    """Return the active random seed. Defaults to 4221 unless overridden."""
+    global _CUSTOM_SEED
+    return _CUSTOM_SEED if _CUSTOM_SEED is not None else 4221  # 121 and 1221
 
 def get_subsets(input_list, sset_size):
     return list(it.combinations(input_list, sset_size))
 
-def set_random_seeds():
-    torch.manual_seed(get_random_seed())
-    np.random.seed(get_random_seed())
-    random.seed(get_random_seed())
+def set_random_seeds(seed: Optional[int] = None):
+    """Set torch/numpy/python random seeds. If seed is provided, store and use it; otherwise use current default.
+
+    This keeps backward compatibility with the old signature while enabling CLI override.
+    """
+    global _CUSTOM_SEED
+    if seed is not None:
+        _CUSTOM_SEED = int(seed)
+    s = get_random_seed()
+    torch.manual_seed(s)
+    np.random.seed(s)
+    random.seed(s)
+
+def set_label_smoothing(value: float = 0.0):
+    """Set global label smoothing factor for CrossEntropyLoss (0.0 disables)."""
+    global _LABEL_SMOOTHING
+    try:
+        _LABEL_SMOOTHING = float(value)
+    except Exception:
+        _LABEL_SMOOTHING = 0.0
 
 def extend_lists(list1, list2, items):
     list1.append(items[0])
@@ -169,8 +195,10 @@ def get_confusion_scores(outputs, normalize=None, device='cpu'):
 
 def get_dataset(dataset, batch_size=128, add_trigger=False):
     if dataset == 'cifar10':
+
         return load_cifar10(batch_size, add_trigger)
     elif dataset == 'cifar100':
+
         return load_cifar100(batch_size)
     elif dataset == 'tinyimagenet':
         return load_tinyimagenet(batch_size)
@@ -234,9 +262,36 @@ def get_full_optimizer(model, lr_params, stepsize_params):
     milestones = stepsize_params[0]
     gammas = stepsize_params[1]
 
-    optimizer = SGD(filter(lambda p: p.requires_grad, model.parameters()), lr=lr, momentum=momentum, weight_decay=weight_decay)
+    optimizer = SGD(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=lr,
+        momentum=momentum,
+        weight_decay=weight_decay,
+        nesterov=True,
+    )
     scheduler = MultiStepMultiLR(optimizer, milestones=milestones, gammas=gammas)
 
+    return optimizer, scheduler
+
+def get_full_optimizer_cosine(model, lr_params, total_epochs: int, eta_min_ratio: float = 0.01):
+    """SGD (nesterov) + CosineAnnealingLR scheduler.
+
+    eta_min is set as lr * eta_min_ratio.
+    """
+    lr=lr_params[0]
+    weight_decay=lr_params[1]
+    momentum=lr_params[2]
+
+    optimizer = SGD(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=lr,
+        momentum=momentum,
+        weight_decay=weight_decay,
+        nesterov=True,
+    )
+    # T_max in epochs; cosine down to eta_min
+    eta_min = lr * float(eta_min_ratio)
+    scheduler = CosineAnnealingLR(optimizer, T_max=int(total_epochs), eta_min=eta_min)
     return optimizer, scheduler
 
 def get_sdn_ic_only_optimizer(model, lr_params, stepsize_params):
@@ -268,6 +323,13 @@ def get_pytorch_device():
 
 
 def get_loss_criterion():
+    # Use label smoothing if supported by current torch version
+    try:
+        if _LABEL_SMOOTHING and _LABEL_SMOOTHING > 0.0:
+            return CrossEntropyLoss(label_smoothing=float(_LABEL_SMOOTHING))
+    except TypeError:
+        # Older torch versions don't support label_smoothing
+        pass
     return CrossEntropyLoss()
 
 
@@ -305,7 +367,7 @@ def get_all_trained_models_info(models_path, use_profiler=False, device='gpu'):
                 input_size = model_params['input_size']
 
                 if architecture == 'dsn':
-                    total_ops, total_params = profile_dsn(model, input_size, device)
+                    total_ops, total_params = profile_sdn(model, input_size, device)
                     print("#Ops (GOps): {}".format(total_ops))
                     print("#Params (mil): {}".format(total_params))
 
