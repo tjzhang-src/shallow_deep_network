@@ -3,6 +3,7 @@
 # conversion between CNNs and SDNs and also plotting
 
 import torch
+import math
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
@@ -131,7 +132,7 @@ class InternalClassifier(nn.Module):
 def get_random_seed():
     """Return the active random seed. Defaults to 4221 unless overridden."""
     global _CUSTOM_SEED
-    return _CUSTOM_SEED if _CUSTOM_SEED is not None else 4221  # 121 and 1221
+    return _CUSTOM_SEED if _CUSTOM_SEED is not None else 5221  # 121 and 1221
 
 def get_subsets(input_list, sset_size):
     return list(it.combinations(input_list, sset_size))
@@ -274,9 +275,9 @@ def get_full_optimizer(model, lr_params, stepsize_params):
     return optimizer, scheduler
 
 def get_full_optimizer_cosine(model, lr_params, total_epochs: int, eta_min_ratio: float = 0.01):
-    """SGD (nesterov) + CosineAnnealingLR scheduler.
+    """SGD (nesterov) + CosineAnnealingLR scheduler with a short warmup.
 
-    eta_min is set as lr * eta_min_ratio.
+    eta_min is set as lr * eta_min_ratio. Includes 5-epoch linear warmup for stability.
     """
     lr=lr_params[0]
     weight_decay=lr_params[1]
@@ -289,9 +290,35 @@ def get_full_optimizer_cosine(model, lr_params, total_epochs: int, eta_min_ratio
         weight_decay=weight_decay,
         nesterov=True,
     )
-    # T_max in epochs; cosine down to eta_min
+    # Warmup + Cosine: implement a simple warmup wrapper
+    class WarmupCosineLR(_LRScheduler):
+        def __init__(self, optimizer, total_epochs: int, warmup_epochs: int, eta_min: float):
+            self.total_epochs = int(total_epochs)
+            self.warmup_epochs = int(max(0, warmup_epochs))
+            self.eta_min = float(eta_min)
+            super().__init__(optimizer)
+
+        def get_lr(self):
+            epoch = self.last_epoch
+            base_lrs = self.base_lrs
+            lrs = []
+            if epoch < self.warmup_epochs and self.warmup_epochs > 0:
+                # linear warmup from lr*0.1 to lr over warmup_epochs (gentler start)
+                warmup_factor = 0.1 + 0.9 * (epoch + 1) / self.warmup_epochs
+                for lr_base in base_lrs:
+                    lrs.append(lr_base * warmup_factor)
+            else:
+                # cosine phase
+                t = max(1, self.total_epochs - self.warmup_epochs)
+                e = min(epoch - self.warmup_epochs + 1, t)
+                for lr_base in base_lrs:
+                    cos_l = self.eta_min + (lr_base - self.eta_min) * (1 + math.cos(math.pi * e / t)) / 2.0
+                    lrs.append(cos_l)
+            return lrs
+
     eta_min = lr * float(eta_min_ratio)
-    scheduler = CosineAnnealingLR(optimizer, T_max=int(total_epochs), eta_min=eta_min)
+    # Increase warmup to 10 epochs for better stability on TinyImageNet
+    scheduler = WarmupCosineLR(optimizer, total_epochs=int(total_epochs), warmup_epochs=10, eta_min=eta_min)
     return optimizer, scheduler
 
 def get_sdn_ic_only_optimizer(model, lr_params, stepsize_params):

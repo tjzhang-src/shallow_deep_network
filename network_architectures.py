@@ -193,15 +193,29 @@ def get_lr_params(model_params):
     model_params['momentum'] = 0.9
 
     network_type = model_params['network_type']
+    task = model_params.get('task', 'cifar10')
 
-    if 'vgg' in network_type or 'wideresnet' in network_type:
-        model_params['weight_decay'] = 0.0005
-
+    # Moderated weight decay for TinyImageNet to avoid underfitting
+    if task == 'tinyimagenet':
+        if 'vgg' in network_type or 'wideresnet' in network_type:
+            model_params['weight_decay'] = 0.0015  # was 0.002
+        else:
+            model_params['weight_decay'] = 0.0008  # was 0.001
     else:
-        model_params['weight_decay'] = 0.0001
+        # Keep original for CIFAR
+        if 'vgg' in network_type or 'wideresnet' in network_type:
+            model_params['weight_decay'] = 0.0005
+        else:
+            model_params['weight_decay'] = 0.0001
     
-    model_params['learning_rate'] = 0.1
-    model_params['epochs'] = 100
+    # Adjust LR/epochs for TinyImageNet (balance under/overfitting)
+    if task == 'tinyimagenet':
+        model_params['learning_rate'] = 0.08  # slightly higher to avoid underfitting
+        model_params['epochs'] = 80  # keep user's reduced epochs
+    else:
+        model_params['learning_rate'] = 0.1
+        model_params['epochs'] = 100
+    
     model_params['milestones'] = [35, 60, 85]
     model_params['gammas'] = [0.1, 0.1, 0.1]
 

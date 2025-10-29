@@ -40,6 +40,7 @@ class CIFAR10:
             transforms.RandomCrop(32, padding=4),
             transforms.ToTensor(),
             normalize,
+            transforms.RandomErasing(p=0.25, scale=(0.02, 0.33), ratio=(0.3, 3.3)),
         ])
         self.normalized = transforms.Compose([
             transforms.ToTensor(),
@@ -75,6 +76,7 @@ class CIFAR100:
             transforms.RandomCrop(32, padding=4),
             transforms.ToTensor(),
             normalize,
+            transforms.RandomErasing(p=0.25, scale=(0.02, 0.33), ratio=(0.3, 3.3)),
         ])
         self.normalized = transforms.Compose([
             transforms.ToTensor(),
@@ -277,11 +279,13 @@ class TinyImagenet:
 
         normalize = transforms.Normalize(mean=[0.4802, 0.4481, 0.3975], std=[0.2302, 0.2265, 0.2262])
         self.augmented = transforms.Compose([
+            transforms.RandomResizedCrop(64, scale=(0.6, 1.0), ratio=(3/4, 4/3)),  # slightly milder crop to reduce underfitting
             transforms.RandomHorizontalFlip(),
-            transforms.RandomCrop(64, padding=8),
-            transforms.ColorJitter(0.2, 0.2, 0.2),
+            transforms.RandomRotation(10),  # milder rotation
+            transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
             transforms.ToTensor(),
             normalize,
+            transforms.RandomErasing(p=0.2, scale=(0.02, 0.33), ratio=(0.3, 3.3)),  # milder erasing
         ])
         self.normalized = transforms.Compose([
             transforms.ToTensor(),

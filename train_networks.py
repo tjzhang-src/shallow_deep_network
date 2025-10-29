@@ -17,19 +17,31 @@ from architectures.CNNs.VGG import VGG
 
 
 
-def train(models_path, untrained_models, sdn=False, ic_only_sdn=False, device='cpu', scheduler_type: str = 'multistep'):
+from typing import Optional
+
+def train(models_path, untrained_models, sdn=False, ic_only_sdn=False, device='cpu', scheduler_type: str = 'multistep',
+          resume: bool = False, resume_epochs: Optional[int] = None, resume_lr: Optional[float] = None):
     print('Training models...')
 
     for base_model in untrained_models:
-        trained_model, model_params = arcs.load_model(models_path, base_model, 0)
+        # Load last checkpoint if resume is requested; otherwise load untrained (epoch=0)
+        if resume:
+            try:
+                trained_model, model_params = arcs.load_model(models_path, base_model, -1)
+                print(f"[resume] Loaded last checkpoint for {base_model}")
+            except Exception:
+                trained_model, model_params = arcs.load_model(models_path, base_model, 0)
+                print(f"[resume] No last checkpoint for {base_model}, starting from untrained")
+        else:
+            trained_model, model_params = arcs.load_model(models_path, base_model, 0)
         dataset = af.get_dataset(model_params['task'])
 
-        learning_rate = model_params['learning_rate']
+        learning_rate = model_params['learning_rate'] if resume_lr is None else resume_lr
         momentum = model_params['momentum']
         weight_decay = model_params['weight_decay']
         milestones = model_params['milestones']
         gammas = model_params['gammas']
-        num_epochs = model_params['epochs']
+        num_epochs = resume_epochs if resume_epochs is not None else model_params['epochs']
 
         model_params['optimizer'] = 'SGD'
 
@@ -71,35 +83,52 @@ def train(models_path, untrained_models, sdn=False, ic_only_sdn=False, device='c
                 trained_model_name = base_model
 
         print('Training: {}...'.format(trained_model_name))
+        if resume:
+            print(f"[resume] epochs this run: {num_epochs}, lr: {learning_rate}")
         trained_model.to(device)
         metrics = trained_model.train_func(trained_model, dataset, num_epochs, optimizer, scheduler, device=device)
-        model_params['train_top1_acc'] = metrics['train_top1_acc']
-        model_params['test_top1_acc'] = metrics['test_top1_acc']
-        model_params['train_top5_acc'] = metrics['train_top5_acc']
-        model_params['test_top5_acc'] = metrics['test_top5_acc']
-        model_params['epoch_times'] = metrics['epoch_times']
-        model_params['lrs'] = metrics['lrs']
+        # Merge metrics when resuming; otherwise overwrite
+        def _merge(key):
+            if resume and isinstance(model_params.get(key), list):
+                model_params[key] = model_params.get(key, []) + metrics.get(key, [])
+            else:
+                model_params[key] = metrics.get(key, [])
+        for k in ['train_top1_acc','test_top1_acc','train_top5_acc','test_top5_acc','epoch_times','lrs']:
+            _merge(k)
+        # Update epochs to cumulative length if resuming
+        if resume:
+            try:
+                model_params['epochs'] = len(model_params.get('train_top1_acc', []))
+            except Exception:
+                pass
         total_training_time = sum(model_params['epoch_times'])
         model_params['total_time'] = total_training_time
         print('Training took {} seconds...'.format(total_training_time))
         arcs.save_model(trained_model, model_params, models_path, trained_model_name, epoch=-1)
 
-def train_sdns(models_path, networks, ic_only=False, device='cpu', scheduler_type: str = 'multistep'):
+def train_sdns(models_path, networks, ic_only=False, device='cpu', scheduler_type: str = 'multistep',
+               resume: bool = False, resume_epochs: Optional[int] = None, resume_lr: Optional[float] = None):
     if ic_only: # if we only train the ICs, we load a pre-trained CNN
         load_epoch = -1
     else: # if we train both ICs and the orig network, we load an untrained CNN
         load_epoch = 0
 
-    for sdn_name in networks:
-        cnn_to_tune = sdn_name.replace('sdn', 'cnn')
-        sdn_params = arcs.load_params(models_path, sdn_name)
-        sdn_params = arcs.get_net_params(sdn_params['network_type'], sdn_params['task'])
-        sdn_model, _ = af.cnn_to_sdn(models_path, cnn_to_tune, sdn_params, load_epoch) # load the CNN and convert it to a SDN
-        arcs.save_model(sdn_model, sdn_params, models_path, sdn_name, epoch=0) # save the resulting SDN
-    train(models_path, networks, sdn=True, ic_only_sdn=ic_only, device=device, scheduler_type=scheduler_type)
+    if resume:
+        # Directly resume training existing SDNs
+        train(models_path, networks, sdn=True, ic_only_sdn=ic_only, device=device, scheduler_type=scheduler_type,
+              resume=True, resume_epochs=resume_epochs, resume_lr=resume_lr)
+    else:
+        for sdn_name in networks:
+            cnn_to_tune = sdn_name.replace('sdn', 'cnn')
+            sdn_params = arcs.load_params(models_path, sdn_name)
+            sdn_params = arcs.get_net_params(sdn_params['network_type'], sdn_params['task'])
+            sdn_model, _ = af.cnn_to_sdn(models_path, cnn_to_tune, sdn_params, load_epoch) # load the CNN and convert it to a SDN
+            arcs.save_model(sdn_model, sdn_params, models_path, sdn_name, epoch=0) # save the resulting SDN
+        train(models_path, networks, sdn=True, ic_only_sdn=ic_only, device=device, scheduler_type=scheduler_type)
 
 
-def train_models(models_path, device='cpu', tasks = ['tinyimagenet','cifar10', 'cifar100'], scheduler_type: str = 'multistep'):
+def train_models(models_path, device='cpu', tasks = ['tinyimagenet','cifar10', 'cifar100'], scheduler_type: str = 'multistep',
+                 resume_cnn: bool = False, resume_sdn: bool = False, resume_epochs: Optional[int] = None, resume_lr: Optional[float] = None):
     
 
     cnns = []
@@ -111,9 +140,11 @@ def train_models(models_path, device='cpu', tasks = ['tinyimagenet','cifar10', '
         af.extend_lists(cnns, sdns, arcs.create_wideresnet32_4(models_path, task, save_type='cd'))
         af.extend_lists(cnns, sdns, arcs.create_mobilenet(models_path, task, save_type='cd'))
 
-    train(models_path, cnns, sdn=False, device=device, scheduler_type=scheduler_type)
+    train(models_path, cnns, sdn=False, device=device, scheduler_type=scheduler_type,
+        resume=resume_cnn, resume_epochs=resume_epochs, resume_lr=resume_lr)
     #train_sdns(models_path, sdns, ic_only=True, device=device, scheduler_type=scheduler_type) # train SDNs with IC-only strategy
-    train_sdns(models_path, sdns, ic_only=False, device=device, scheduler_type=scheduler_type) # train SDNs with SDN-training strategy
+    train_sdns(models_path, sdns, ic_only=False, device=device, scheduler_type=scheduler_type,
+           resume=resume_sdn, resume_epochs=resume_epochs, resume_lr=resume_lr) # train SDNs with SDN-training strategy
 
 
 # for backdoored models, load a backdoored CNN and convert it to an SDN via IC-only strategy
@@ -144,6 +175,10 @@ def main():
     parser.add_argument('--tasks', type=str, nargs='+', default=None, help="Tasks to train, e.g., --tasks cifar10 cifar100 tinyimagenet")
     parser.add_argument('--scheduler', type=str, choices=['multistep','cosine'], default='cosine', help='LR scheduler type')
     parser.add_argument('--label_smoothing', type=float, default=0.1, help='Label smoothing factor for CE loss (0 disables)')
+    parser.add_argument('--resume_cnn', action='store_true', help='Resume CNN training from last checkpoints if available')
+    parser.add_argument('--resume_sdn', action='store_true', help='Resume SDN training from last checkpoints if available')
+    parser.add_argument('--resume_epochs', type=int, default=None, help='Number of epochs to run when resuming (optional)')
+    parser.add_argument('--resume_lr', type=float, default=None, help='Learning rate override when resuming (optional)')
     args = parser.parse_args()
 
     # Seed handling
@@ -162,7 +197,7 @@ def main():
         device = af.get_pytorch_device()
 
     # Tasks handling
-    tasks = args.tasks if args.tasks is not None else ['tinyimagenet','cifar10', 'cifar100']
+    tasks = args.tasks if args.tasks is not None else ['tinyimagenet'] #,'cifar10', 'cifar100'
 
     # Loss configuration
     af.set_label_smoothing(args.label_smoothing)
@@ -171,7 +206,9 @@ def main():
     af.create_path(models_path)
     af.set_logger('outputs/train_models'.format(af.get_random_seed()))
 
-    train_models(models_path, device, tasks, scheduler_type=args.scheduler)  # e.g., ['tinyimagenet','cifar10', 'cifar100']
+    train_models(models_path, device, tasks, scheduler_type=args.scheduler,
+                 resume_cnn=args.resume_cnn, resume_sdn=args.resume_sdn,
+                 resume_epochs=args.resume_epochs, resume_lr=args.resume_lr)  # e.g., ['tinyimagenet','cifar10', 'cifar100']
     #sdn_ic_only_backdoored(device)
 
 if __name__ == '__main__':

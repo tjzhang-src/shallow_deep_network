@@ -49,7 +49,7 @@ import tqdm
 import network_architectures as arcs
 import aux_funcs as af
 
-device = torch.device("cuda:6" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
 def parse_float_expr(v: str) -> float:
@@ -351,7 +351,8 @@ def attack_batch(model, x, y, thresholds, eps, alpha, steps, lambda_exits, lambd
             delta_pix = delta
         linf = delta_pix.abs().view(batch_size, -1).max(dim=1)[0].cpu()
         l2 = delta_pix.view(batch_size, -1).norm(p=2, dim=1).cpu()
-    return x_adv.detach(), linf, l2, preds_adv, exits_adv, int(conflict_steps / max(1, steps))
+    # Return conflict ratio (fraction of steps with conflicting gradients)
+    return x_adv.detach(), linf, l2, preds_adv, exits_adv, (conflict_steps / max(1, steps))
 
 def list_candidate_model_names(models_path: str) -> List[str]:
     """列出 models_path 下可能的模型名称，并用 load_model 校验。"""
@@ -441,7 +442,9 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
     exit_counts_adv = [0] * (num_internal + 2)
     avg_linf: List[float] = []
     avg_l2: List[float] = []
-    pc_conflict_fraction = 0
+    # Accumulate PCGrad conflict fraction weighted by number of attacked samples
+    pc_conflict_fraction = 0.0
+    pc_conflict_weight = 0
 
     pbar = tqdm.tqdm(testloader, desc=f"{model_name}")
     for imgs, labels in pbar:
@@ -478,7 +481,7 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
         imgs_correct = imgs[mask_idx]
         labels_correct = labels[mask_idx]
 
-        x_adv_subset, linf_vals, l2_vals, preds_adv_subset, exits_adv_subset, conflict_flag = attack_batch(
+        x_adv_subset, linf_vals, l2_vals, preds_adv_subset, exits_adv_subset, conflict_ratio = attack_batch(
             model, imgs_correct, labels_correct,
             entropy_thresholds, eps, alpha, args.pgd_steps,
             lambda_exits,args.lambda_earlyexits, args.lambda_ce, args.lambda_l2,
@@ -490,8 +493,10 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
             pcgrad_mode=args.pcgrad_mode, pcgrad_partial=args.pcgrad_partial,
             pre_target_margin=args.pre_target_margin, pre_target_weight=args.pre_target_weight
         )
-        if conflict_flag:
-            pc_conflict_fraction += batch_size
+        # Weight by number of attacked samples in this batch
+        attacked_count = imgs_correct.size(0)
+        pc_conflict_fraction += float(conflict_ratio) * attacked_count
+        pc_conflict_weight += attacked_count
 
         imgs_adv = imgs.clone()
         imgs_adv[mask_idx] = x_adv_subset
@@ -547,7 +552,8 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
         'avg_l2': (sum(avg_l2)/len(avg_l2)) if avg_l2 else 0.0,
         'thresholds': entropy_thresholds,
         'lambda_exits': lambda_exits,
-        'pcgrad_conflict_frac': pc_conflict_fraction / max(1, total),
+    # Average fraction of conflicting steps across attacked samples
+    'pcgrad_conflict_frac': pc_conflict_fraction / max(1, pc_conflict_weight),
         'preferred_exit': int(args.prefer_exit) if args.prefer_exit is not None else None,
         'gradnorm': bool(args.gradnorm),
     }
@@ -635,7 +641,7 @@ def main():
     parser.add_argument('--skip_contains', nargs='*', default=["cnn","cifar100","cifar10"], help='排除名字中包含这些子串的模型（多值 OR）')
     parser.add_argument('--pre_target_margin', type=float, default=0.0, help='在目标出口之前的层，额外增加的熵阈值裕量 (默认0不启用)')
     parser.add_argument('--pre_target_weight', type=float, default=1.0, help='目标之前层的约束权重(乘子)')
-    parser.add_argument('--prefer_exit', type=int, default=7, help='攻击时倾向让样本在该出口退出（1..N；N为最终出口）')
+    parser.add_argument('--prefer_exit', type=int, default=5, help='攻击时倾向让样本在该出口退出（1..N；N为最终出口）')
     parser.add_argument('--out_dir', type=str, default='outputs/test_results', help='导出结果目录')
     args = parser.parse_args()
 
