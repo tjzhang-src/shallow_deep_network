@@ -48,6 +48,7 @@ import tqdm
 
 import network_architectures as arcs
 import aux_funcs as af
+import profiler as prof
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -131,7 +132,7 @@ def select_exits(outputs: List[torch.Tensor], thresholds: List[float]) -> Tuple[
 
 
 def attack_batch(model, x, y, thresholds, eps, alpha, steps, lambda_exits, lambda_earlyexits, lambda_ce, lambda_l2,
-                 cw=True, c=0.15, kappa=5, pcgrad=False, same_acc_early_loss=False,
+                 cw=False, c=0.15, kappa=5, pcgrad=False, same_acc_early_loss=False,
                  prefer_exit_id: Optional[int] = None,
                  norm_mean: Optional[List[float]] = None,
                  norm_std: Optional[List[float]] = None,
@@ -141,7 +142,11 @@ def attack_batch(model, x, y, thresholds, eps, alpha, steps, lambda_exits, lambd
                  pcgrad_mode: str = 'symmetric',
                  pcgrad_partial: float = 1.0,
                  pre_target_margin: float = 0.0,
-                 pre_target_weight: float = 1.0):
+                 pre_target_weight: float = 1.0,
+                 pgd_update_mode: str = 'linf_sign',
+                 pgd_momentum: float = 0.0,
+                 auto_balance_early: bool = False,
+                 ab_target_ratio: float = 1.0):
     """对 batch 做 constrained PGD，返回 (x_adv, linf, l2, preds_adv, exits_adv, pcgrad_conflict_count)
 
     仅对原本被正确分类的样本调用。兼容 SDN（多出口）与 CNN（单出口）。
@@ -188,6 +193,8 @@ def attack_batch(model, x, y, thresholds, eps, alpha, steps, lambda_exits, lambd
     w = None
     opt_w = None
     initial_losses = None
+    # momentum buffer for PGD (if enabled)
+    v = torch.zeros_like(delta)
     for _ in range(steps):
         # Compose adversarial example in normalized space and clamp to valid normalized bounds
         x_adv = (x_orig + delta).clamp(lower, upper)
@@ -326,11 +333,38 @@ def attack_batch(model, x, y, thresholds, eps, alpha, steps, lambda_exits, lambd
                 w.data = torch.clamp(w.data, min=1e-4)
                 w.data = (2.0 * w.data) / w.data.sum()
         else:
-            total_loss = loss_early_total * lambda_earlyexits + lambda_ce * loss_ce_term + lambda_l2 * loss_l2_term
+            # Optionally auto-balance early loss magnitude by gradient norm ratio to CE
+            scale_early = 1.0
+            if auto_balance_early and early_losses:
+
+                g_acc_tmp = torch.autograd.grad(lambda_ce * loss_ce_term, delta, retain_graph=True)[0]
+                g_early_tmp = torch.autograd.grad(lambda_earlyexits * loss_early_total, delta, retain_graph=True)[0]
+                norm_acc = g_acc_tmp.view(g_acc_tmp.size(0), -1).norm(p=2, dim=1).mean()
+                norm_early = g_early_tmp.view(g_early_tmp.size(0), -1).norm(p=2, dim=1).mean()
+                if float(norm_early) > 0.0:
+                    scale_early = float(ab_target_ratio) * float(norm_acc) / float(norm_early)
+                    # keep within a sane range
+                    scale_early = float(max(0.1, min(10.0, scale_early)))
+            total_loss = (scale_early * (loss_early_total * lambda_earlyexits)) + (lambda_ce * loss_ce_term) + (lambda_l2 * loss_l2_term)
             grads = torch.autograd.grad(total_loss, delta, retain_graph=False)[0]
 
         # PGD 更新（最小化 loss），在归一化空间按通道尺度更新与投影
-        delta.data = delta.data - alpha_tensor * grads.sign()
+        # Apply momentum if enabled
+        if pgd_momentum and pgd_momentum > 0.0:
+            v = pgd_momentum * v + grads
+            grad_dir = v
+        else:
+            grad_dir = grads
+
+        if pgd_update_mode == 'linf_sign':
+            step_dir = grad_dir.sign()
+        else:
+            # l2-like direction
+            flat = grad_dir.view(grad_dir.size(0), -1)
+            norms = flat.norm(p=2, dim=1).view(-1, 1, 1, 1) + 1e-12
+            step_dir = grad_dir / norms
+
+        delta.data = delta.data - alpha_tensor * step_dir
         delta.data = torch.max(torch.min(delta.data, eps_tensor), -eps_tensor)
         delta.data = (x_orig + delta.data).clamp(lower, upper) - x_orig
         delta.grad = None
@@ -445,8 +479,22 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
     # Accumulate PCGrad conflict fraction weighted by number of attacked samples
     pc_conflict_fraction = 0.0
     pc_conflict_weight = 0
+    # FRP (flops recovery) lists: per-candidate sample ratio
+    frr_flops_vals = []
 
     pbar = tqdm.tqdm(testloader, desc=f"{model_name}")
+    # Pre-compute per-exit FLOPs (cumulative) using profiler if available
+    try:
+        input_size = 64 if task == 'tinyimagenet' else 32
+        out_ops, out_params = prof.profile_sdn(model, input_size, device)
+        # out_ops are in GFLOPs per output id (0-based). Build mapping exit_id(1-based)->flops
+        ops_per_exit = {}
+        max_key = max(out_ops.keys()) if out_ops else 0
+        for exit_id in range(1, (num_internal + 2)):
+            gflops = out_ops.get(exit_id - 1, out_ops.get(max_key, 0.0))
+            ops_per_exit[exit_id] = float(gflops) * 1e9
+    except Exception:
+        ops_per_exit = None
     for imgs, labels in pbar:
         imgs = imgs.to(device)
         labels = labels.to(device)
@@ -491,7 +539,9 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
             norm_mean=mean, norm_std=std,
             gradnorm=args.gradnorm, gradnorm_alpha=args.gradnorm_alpha, gradnorm_lr=args.gradnorm_lr,
             pcgrad_mode=args.pcgrad_mode, pcgrad_partial=args.pcgrad_partial,
-            pre_target_margin=args.pre_target_margin, pre_target_weight=args.pre_target_weight
+            pre_target_margin=args.pre_target_margin, pre_target_weight=args.pre_target_weight,
+            pgd_update_mode=args.pgd_update_mode, pgd_momentum=args.pgd_momentum,
+            auto_balance_early=args.auto_balance_early, ab_target_ratio=args.ab_target_ratio
         )
         # Weight by number of attacked samples in this batch
         attacked_count = imgs_correct.size(0)
@@ -509,6 +559,33 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
                 exits_adv_batch = torch.full((batch_size,), 1, dtype=torch.long)
             final_out_adv = outputs_adv[-1] if isinstance(outputs_adv, list) else outputs_adv
             final_pred_adv = final_out_adv.argmax(dim=1)
+
+        # --- FLOPs-based recovery ratio per attacked sample (if profiler available) ---
+        if ops_per_exit is not None and num_internal > 0:
+            final_id = num_internal + 1
+            # mask_idx (device) points to attacked positions; use CPU indices
+            try:
+                attacked_pos_cpu = mask_idx.cpu()
+            except Exception:
+                attacked_pos_cpu = None
+            if attacked_pos_cpu is not None and attacked_pos_cpu.numel() > 0:
+                clean_ex = exits_clean[attacked_pos_cpu]  # CPU tensor of clean exit ids
+                adv_ex = exits_adv_batch[attacked_pos_cpu]  # CPU tensor of adv exit ids
+                cnn_flops = ops_per_exit.get(final_id, None)
+                if cnn_flops is not None:
+                    for i_idx in range(attacked_pos_cpu.numel()):
+                        c_ex = int(clean_ex[i_idx].item())
+                        a_ex = int(adv_ex[i_idx].item())
+                        fl_before = ops_per_exit.get(c_ex, None)
+                        fl_after = ops_per_exit.get(a_ex, None)
+                        if fl_before is None or fl_after is None:
+                            continue
+                        denom = (cnn_flops - fl_before)
+                        if denom <= 0:
+                            continue
+                        ratio = (fl_after - fl_before) / denom
+                        ratio = max(0.0, min(1.0, float(ratio)))
+                        frr_flops_vals.append(ratio)
 
         correct_adv += (final_pred_adv == labels).sum().item()
         for e in exits_adv_batch:
@@ -557,6 +634,21 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
         'preferred_exit': int(args.prefer_exit) if args.prefer_exit is not None else None,
         'gradnorm': bool(args.gradnorm),
     }
+    # Aggregate FLOPs-based FRR stats
+    if frr_flops_vals:
+        svals = sorted(frr_flops_vals)
+        nfv = len(svals)
+        frr_mean = sum(svals) / nfv
+        if nfv % 2 == 1:
+            frr_median = svals[nfv // 2]
+        else:
+            frr_median = 0.5 * (svals[nfv // 2 - 1] + svals[nfv // 2])
+    else:
+        frr_mean = 0.0
+        frr_median = 0.0
+    rec['frr_flops_count'] = len(frr_flops_vals)
+    rec['frr_flops_mean'] = frr_mean
+    rec['frr_flops_median'] = frr_median
     if str(device).startswith('cuda'):
         del model
         torch.cuda.empty_cache()
@@ -572,7 +664,8 @@ def save_attack_summary(records: List[dict], out_dir='outputs/test_results'):
     fields = [
         'model_name','task','num_exits','eps','alpha','pgd_steps','cw','pcgrad',
         'clean_final_acc','adv_final_acc','avg_exit_clean','avg_exit_adv','avg_linf','avg_l2',
-        'thresholds','lambda_exits','exit_dist_clean','exit_dist_adv','pcgrad_conflict_frac','preferred_exit','gradnorm'
+        'thresholds','lambda_exits','exit_dist_clean','exit_dist_adv','pcgrad_conflict_frac',
+        'frr_flops_count','frr_flops_mean','frr_flops_median','preferred_exit','gradnorm'
     ]
     with open(csv_path, 'w', newline='') as f:
         wr = csv.DictWriter(f, fieldnames=fields)
@@ -602,6 +695,8 @@ def save_attack_summary(records: List[dict], out_dir='outputs/test_results'):
             f.write(f"  - Norms (Linf/L2): {r['avg_linf']:.6f} / {r['avg_l2']:.6f}\n")
             ths = r.get('thresholds', [])
             f.write(f"  - Thresholds: {','.join(f'{x:.2f}' for x in ths) if ths else '-'}\n\n")
+            if r.get('num_exits', 1) > 1:
+                f.write(f"  - FRP (flops) count/mean/median: {r.get('frr_flops_count',0)} / {r.get('frr_flops_mean',0.0):.4f} / {r.get('frr_flops_median',0.0):.4f}\n\n")
             pe = r.get('preferred_exit', None)
             if pe is not None:
                 f.write(f"  - Preferred exit: {pe}\n\n")
@@ -619,17 +714,17 @@ def main():
     parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--entropy_thresholds', type=str, default='0.20,0.20,0.30,0.3,0.35,0.35', help='逗号分隔，对应每个内部出口')
     parser.add_argument('--lambda_exits', type=str, default="1,0.9,0.8,0.7,0.6,0.5,0.4", help='逗号分隔，对应各内部出口权重；缺省=全部1.0')
-    parser.add_argument('--lambda_earlyexits', type=float, default=1.0)
+    parser.add_argument('--lambda_earlyexits', type=float, default=10.0)
     parser.add_argument('--lambda_ce', type=float, default=1.0)
     parser.add_argument('--lambda_l2', type=float, default=0.01)
     parser.add_argument('--eps', type=str, default='8/255')
     parser.add_argument('--alpha', type=str, default='2/255')
     parser.add_argument('--pgd_steps', type=int, default=20)
-    parser.add_argument('--cw', action='store_true', default=True, help='使用 CW 风格保持正确 (默认 False=CE)')
-    parser.add_argument('--c', type=float, default=0.55, help='CW 系数 c')
-    parser.add_argument('--kappa', type=float, default=5.0, help='CW 置信度 margin')
-    parser.add_argument('--pcgrad', action='store_true', help='是否使用 PCGrad', default=True)
-    parser.add_argument('--pcgrad_mode', type=str, choices=['one-sided','symmetric'], default='symmetric', help='PCGrad 投影方式：单边/对称')
+    parser.add_argument('--cw', action='store_true', default=False, help='使用 CW 风格保持正确 (默认 False=CE)')
+    parser.add_argument('--c', type=float, default=0.1, help='CW 系数 c')
+    parser.add_argument('--kappa', type=float, default=3, help='CW 置信度 margin')
+    parser.add_argument('--pcgrad', action='store_true', help='是否使用 PCGrad', default=False)
+    parser.add_argument('--pcgrad_mode', type=str, choices=['one-sided','symmetric'], default='one-sided', help='PCGrad 投影方式：单边/对称')
     parser.add_argument('--pcgrad_partial', type=float, default=1.0, help='PCGrad 投影强度比例 [0,1]，1为完全投影')
     parser.add_argument('--gradnorm', action='store_true', help='是否使用 GradNorm 解决多目标梯度冲突', default=False)
     parser.add_argument('--gradnorm_alpha', type=float, default=1.0, help='GradNorm 的 alpha 超参数')
@@ -638,11 +733,16 @@ def main():
     parser.add_argument('--device', type=str, default='cuda:2', help='手动指定设备，如 cuda:0')
     parser.add_argument('--only', nargs='*', help='仅评测这些模型名（可多个）')
     parser.add_argument('--skip', nargs='*', default=[], help='跳过这些模型名')
-    parser.add_argument('--skip_contains', nargs='*', default=["cnn","cifar100","cifar10"], help='排除名字中包含这些子串的模型（多值 OR）')
+    parser.add_argument('--skip_contains', nargs='*', default=["cnn","cifar100","imagenet", "training"], help='排除名字中包含这些子串的模型（多值 OR）')
     parser.add_argument('--pre_target_margin', type=float, default=0.0, help='在目标出口之前的层，额外增加的熵阈值裕量 (默认0不启用)')
     parser.add_argument('--pre_target_weight', type=float, default=1.0, help='目标之前层的约束权重(乘子)')
-    parser.add_argument('--prefer_exit', type=int, default=5, help='攻击时倾向让样本在该出口退出（1..N；N为最终出口）')
+    parser.add_argument('--prefer_exit', type=int, default=7, help='攻击时倾向让样本在该出口退出（1..N；N为最终出口）')
     parser.add_argument('--out_dir', type=str, default='outputs/test_results', help='导出结果目录')
+    # PGD update options
+    parser.add_argument('--pgd_update_mode', type=str, choices=['linf_sign','l2_dir','linf_projected_dir'], default='l2_dir', help='PGD 更新方向：Linf-sign 或 L2 方向（保留Linf投影）')
+    parser.add_argument('--pgd_momentum', type=float, default=0.9, help='PGD 动量项系数，0禁用')
+    parser.add_argument('--auto_balance_early', action='store_true', default=False, help='按梯度范数比自适应缩放早期损失')
+    parser.add_argument('--ab_target_ratio', type=float, default=1.0, help='自适应缩放目标：||g_early|| ≈ ab_target_ratio * ||g_acc||')
     args = parser.parse_args()
 
     global device
