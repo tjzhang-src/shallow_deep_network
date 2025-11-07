@@ -481,6 +481,9 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
     pc_conflict_weight = 0
     # FRP (flops recovery) lists: per-candidate sample ratio
     frr_flops_vals = []
+    # Energy (pJ) trackers
+    energy_clean_pj: List[float] = []
+    energy_adv_pj: List[float] = []
 
     pbar = tqdm.tqdm(testloader, desc=f"{model_name}")
     # Pre-compute per-exit FLOPs (cumulative) using profiler if available
@@ -511,6 +514,16 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
             final_out_clean = outputs_clean[-1] if isinstance(outputs_clean, list) else outputs_clean
             final_pred_clean = final_out_clean.argmax(dim=1)
 
+        # --- Clean energy (if profiler available) ---
+        if ops_per_exit is not None:
+            # energy per flop = 3.2 pJ
+            for e in exits_clean:
+                eid = int(e.item())
+                fl = ops_per_exit.get(eid, None)
+                if fl is None:
+                    continue
+                energy_clean_pj.append(float(fl) * 3.2)
+
         correct_mask = (final_pred_clean == labels).cpu()
         correct_clean += correct_mask.sum().item()
         for e in exits_clean:
@@ -522,6 +535,17 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
                 idx = int(e.item()) if num_internal > 0 else 1
                 exit_counts_adv[idx] += 1
             correct_adv += (final_pred_clean == labels).sum().item()
+            # If no attacked samples, adversarial exits equal clean; mirror energy as well
+            if ops_per_exit is not None:
+                # reuse the same per-sample energies computed above for this batch
+                # Append the last batch_size clean energies to adv energies
+                # safer: recompute for clarity
+                for e in exits_clean:
+                    eid = int(e.item())
+                    fl = ops_per_exit.get(eid, None)
+                    if fl is None:
+                        continue
+                    energy_adv_pj.append(float(fl) * 3.2)
             pbar.set_postfix(clean_acc=f"{correct_clean/max(1,total):.4f}", adv_acc=f"{correct_adv/max(1,total):.4f}")
             continue
 
@@ -559,6 +583,15 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
                 exits_adv_batch = torch.full((batch_size,), 1, dtype=torch.long)
             final_out_adv = outputs_adv[-1] if isinstance(outputs_adv, list) else outputs_adv
             final_pred_adv = final_out_adv.argmax(dim=1)
+
+        # --- Adv energy (if profiler available) ---
+        if ops_per_exit is not None:
+            for e in exits_adv_batch:
+                eid = int(e.item())
+                fl = ops_per_exit.get(eid, None)
+                if fl is None:
+                    continue
+                energy_adv_pj.append(float(fl) * 3.2)
 
         # --- FLOPs-based recovery ratio per attacked sample (if profiler available) ---
         if ops_per_exit is not None and num_internal > 0:
@@ -634,6 +667,21 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
         'preferred_exit': int(args.prefer_exit) if args.prefer_exit is not None else None,
         'gradnorm': bool(args.gradnorm),
     }
+    # Aggregate energy stats (pJ)
+    if energy_clean_pj:
+        rec['avg_energy_clean_pj'] = sum(energy_clean_pj) / len(energy_clean_pj) / 1e9
+    else:
+        rec['avg_energy_clean_pj'] = 0.0
+    if energy_adv_pj:
+        rec['avg_energy_adv_pj'] = sum(energy_adv_pj) / len(energy_adv_pj) / 1e9
+    else:
+        rec['avg_energy_adv_pj'] = 0.0
+    # Energy ratio: adv over clean (unitless)
+    try:
+        denom = float(rec['avg_energy_clean_pj'])
+        rec['energy_ratio_adv_over_clean'] = (float(rec['avg_energy_adv_pj']) / denom) if denom > 0 else 0.0
+    except Exception:
+        rec['energy_ratio_adv_over_clean'] = 0.0
     # Aggregate FLOPs-based FRR stats
     if frr_flops_vals:
         svals = sorted(frr_flops_vals)
@@ -665,6 +713,7 @@ def save_attack_summary(records: List[dict], out_dir='outputs/test_results'):
         'model_name','task','num_exits','eps','alpha','pgd_steps','cw','pcgrad',
         'clean_final_acc','adv_final_acc','avg_exit_clean','avg_exit_adv','avg_linf','avg_l2',
         'thresholds','lambda_exits','exit_dist_clean','exit_dist_adv','pcgrad_conflict_frac',
+        'avg_energy_clean_pj','avg_energy_adv_pj','energy_ratio_adv_over_clean',
         'frr_flops_count','frr_flops_mean','frr_flops_median','preferred_exit','gradnorm'
     ]
     with open(csv_path, 'w', newline='') as f:
@@ -693,6 +742,8 @@ def save_attack_summary(records: List[dict], out_dir='outputs/test_results'):
             f.write(f"  - Clean/Adv: {r['clean_final_acc']:.2f}% / {r['adv_final_acc']:.2f}%\n")
             f.write(f"  - Avg exit (clean/adv): {r['avg_exit_clean']:.2f} / {r['avg_exit_adv']:.2f}\n")
             f.write(f"  - Norms (Linf/L2): {r['avg_linf']:.6f} / {r['avg_l2']:.6f}\n")
+            f.write(f"  - Energy (pJ) avg (clean/adv): {r.get('avg_energy_clean_pj',0.0):.3f} / {r.get('avg_energy_adv_pj',0.0):.3f}\n")
+            f.write(f"  - Energy ratio (adv/clean): {r.get('energy_ratio_adv_over_clean',0.0):.4f}\n")
             ths = r.get('thresholds', [])
             f.write(f"  - Thresholds: {','.join(f'{x:.2f}' for x in ths) if ths else '-'}\n\n")
             if r.get('num_exits', 1) > 1:
@@ -714,8 +765,8 @@ def main():
     parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--entropy_thresholds', type=str, default='0.20,0.20,0.30,0.3,0.35,0.35', help='逗号分隔，对应每个内部出口')
     parser.add_argument('--lambda_exits', type=str, default="1,0.9,0.8,0.7,0.6,0.5,0.4", help='逗号分隔，对应各内部出口权重；缺省=全部1.0')
-    parser.add_argument('--lambda_earlyexits', type=float, default=10.0)
-    parser.add_argument('--lambda_ce', type=float, default=1.0)
+    parser.add_argument('--lambda_earlyexits', type=float, default=160)
+    parser.add_argument('--lambda_ce', type=float, default=1)
     parser.add_argument('--lambda_l2', type=float, default=0.01)
     parser.add_argument('--eps', type=str, default='8/255')
     parser.add_argument('--alpha', type=str, default='2/255')
@@ -723,8 +774,8 @@ def main():
     parser.add_argument('--cw', action='store_true', default=False, help='使用 CW 风格保持正确 (默认 False=CE)')
     parser.add_argument('--c', type=float, default=0.1, help='CW 系数 c')
     parser.add_argument('--kappa', type=float, default=3, help='CW 置信度 margin')
-    parser.add_argument('--pcgrad', action='store_true', help='是否使用 PCGrad', default=False)
-    parser.add_argument('--pcgrad_mode', type=str, choices=['one-sided','symmetric'], default='one-sided', help='PCGrad 投影方式：单边/对称')
+    parser.add_argument('--pcgrad', action='store_true', help='是否使用 PCGrad', default=True)
+    parser.add_argument('--pcgrad_mode', type=str, choices=['one-sided','symmetric'], default='symmetric', help='PCGrad 投影方式：单边/对称')
     parser.add_argument('--pcgrad_partial', type=float, default=1.0, help='PCGrad 投影强度比例 [0,1]，1为完全投影')
     parser.add_argument('--gradnorm', action='store_true', help='是否使用 GradNorm 解决多目标梯度冲突', default=False)
     parser.add_argument('--gradnorm_alpha', type=float, default=1.0, help='GradNorm 的 alpha 超参数')
@@ -733,8 +784,8 @@ def main():
     parser.add_argument('--device', type=str, default='cuda:2', help='手动指定设备，如 cuda:0')
     parser.add_argument('--only', nargs='*', help='仅评测这些模型名（可多个）')
     parser.add_argument('--skip', nargs='*', default=[], help='跳过这些模型名')
-    parser.add_argument('--skip_contains', nargs='*', default=["cnn","cifar100","imagenet", "training"], help='排除名字中包含这些子串的模型（多值 OR）')
-    parser.add_argument('--pre_target_margin', type=float, default=0.0, help='在目标出口之前的层，额外增加的熵阈值裕量 (默认0不启用)')
+    parser.add_argument('--skip_contains', nargs='*', default=["cnn","cifar10", "training"], help='排除名字中包含这些子串的模型（多值 OR）')
+    parser.add_argument('--pre_target_margin', type=float, default=0.1, help='在目标出口之前的层，额外增加的熵阈值裕量 (默认0不启用)')
     parser.add_argument('--pre_target_weight', type=float, default=1.0, help='目标之前层的约束权重(乘子)')
     parser.add_argument('--prefer_exit', type=int, default=7, help='攻击时倾向让样本在该出口退出（1..N；N为最终出口）')
     parser.add_argument('--out_dir', type=str, default='outputs/test_results', help='导出结果目录')
