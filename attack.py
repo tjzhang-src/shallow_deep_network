@@ -45,12 +45,65 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 from torch.utils.data import DataLoader
 import tqdm
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 import network_architectures as arcs
 import aux_funcs as af
 import profiler as prof
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
+def _compute_eec_score(exit_dist: List[int]) -> float:
+    """Compute EECScore: normalized area under cumulative early-exit curve.
+
+    Given per-exit counts or proportions for exits 1..N (including final as N),
+    build cumulative fractions c_k and return mean(c_k), in [0,1]. Higher means earlier exits on average.
+    """
+    s = float(sum(exit_dist))
+    if s <= 0:
+        return 0.0
+    probs = [float(x) / s for x in exit_dist]
+    cum = 0.0
+    acc = 0.0
+    for p in probs:
+        cum += p
+        acc += cum
+    return acc / len(exit_dist)
+
+
+def _compute_curve_distances(c1: List[float], c2: List[float]) -> Tuple[float, float]:
+    """Compute simple distances between two aligned cumulative curves c1, c2.
+
+    - Hausdorff (aligned grid): max_k |c1[k]-c2[k]|
+    - SSPD (aligned grid surrogate): mean_k |c1[k]-c2[k]|
+    """
+    if not c1 or not c2 or len(c1) != len(c2):
+        return 0.0, 0.0
+    diffs = [abs(float(a) - float(b)) for a, b in zip(c1, c2)]
+    haus = max(diffs) if diffs else 0.0
+    sspd = sum(diffs) / len(diffs) if diffs else 0.0
+    return haus, sspd
+
+
+def _build_exit_to_blockcount(model) -> dict:
+    """Map exit_id (1..N) to a coarse 'computational blocks' count based on SDN layers.
+
+    We define blocks as SDN 'layers' modules traversed. For an internal exit attached to
+    model.layers[i], blocks = i+1. For the final classifier, blocks = len(model.layers).
+    """
+    mapping = {}
+    exit_id = 1
+    for i, blk in enumerate(model.layers):
+        has_exit = getattr(blk, 'output', None) is not None and not getattr(blk, 'no_output', True)
+        if has_exit:
+            mapping[exit_id] = i + 1
+            exit_id += 1
+    # final output id
+    mapping[exit_id] = len(model.layers)
+    return mapping
 
 
 def parse_float_expr(v: str) -> float:
@@ -146,7 +199,9 @@ def attack_batch(model, x, y, thresholds, eps, alpha, steps, lambda_exits, lambd
                  pgd_update_mode: str = 'linf_sign',
                  pgd_momentum: float = 0.0,
                  auto_balance_early: bool = False,
-                 ab_target_ratio: float = 1.0):
+                 ab_target_ratio: float = 1.0,
+                 snapshot_every: int = 0,
+                 snapshot_steps: Optional[List[int]] = None):
     """对 batch 做 constrained PGD，返回 (x_adv, linf, l2, preds_adv, exits_adv, pcgrad_conflict_count)
 
     仅对原本被正确分类的样本调用。兼容 SDN（多出口）与 CNN（单出口）。
@@ -195,7 +250,14 @@ def attack_batch(model, x, y, thresholds, eps, alpha, steps, lambda_exits, lambd
     initial_losses = None
     # momentum buffer for PGD (if enabled)
     v = torch.zeros_like(delta)
-    for _ in range(steps):
+    # configure snapshot set (1-based step indices)
+    snapshot_set: set = set()
+    if snapshot_steps is not None and len(snapshot_steps) > 0:
+        snapshot_set = set(int(s) for s in snapshot_steps if int(s) >= 1)
+    elif snapshot_every and int(snapshot_every) > 0:
+        snapshot_set = set(i for i in range(int(snapshot_every), steps + 1, int(snapshot_every)))
+    snapshots_summary: dict = {}
+    for step_idx in range(1, steps + 1):
         # Compose adversarial example in normalized space and clamp to valid normalized bounds
         x_adv = (x_orig + delta).clamp(lower, upper)
         outputs = model.forward(x_adv)
@@ -368,6 +430,36 @@ def attack_batch(model, x, y, thresholds, eps, alpha, steps, lambda_exits, lambd
         delta.data = torch.max(torch.min(delta.data, eps_tensor), -eps_tensor)
         delta.data = (x_orig + delta.data).clamp(lower, upper) - x_orig
         delta.grad = None
+        # snapshot after update
+        if step_idx in snapshot_set:
+            with torch.no_grad():
+                x_snap = (x_orig + delta).clamp(lower, upper)
+                snap_outs = model.forward(x_snap)
+                if isinstance(snap_outs, list):
+                    preds_s, exits_s = select_exits(snap_outs, thresholds)
+                    final_out_s = snap_outs[-1]
+                else:
+                    preds_s = snap_outs.argmax(dim=1).cpu()
+                    exits_s = torch.full((batch_size,), 1, dtype=torch.long)
+                    final_out_s = snap_outs
+                final_pred_s = final_out_s.argmax(dim=1)
+                correct_s = int((final_pred_s == y).sum().item())
+                # build exit counts vector length = num_internal+1
+                num_internal_local = model.num_output - 1 if hasattr(model, 'num_output') else 0
+                counts = [0] * (num_internal_local + 1)
+                for e in exits_s:
+                    eid = int(e.item()) if num_internal_local > 0 else 1
+                    # map final to last index (1..N)
+                    if eid < 1:
+                        eid = 1
+                    if eid > (num_internal_local + 1):
+                        eid = num_internal_local + 1
+                    counts[eid - 1] += 1
+                snapshots_summary[int(step_idx)] = {
+                    'exit_counts': counts,
+                    'correct': correct_s,
+                    'num': batch_size,
+                }
 
     x_adv = (x_orig + delta).clamp(lower, upper)
     with torch.no_grad():
@@ -386,7 +478,7 @@ def attack_batch(model, x, y, thresholds, eps, alpha, steps, lambda_exits, lambd
         linf = delta_pix.abs().view(batch_size, -1).max(dim=1)[0].cpu()
         l2 = delta_pix.view(batch_size, -1).norm(p=2, dim=1).cpu()
     # Return conflict ratio (fraction of steps with conflicting gradients)
-    return x_adv.detach(), linf, l2, preds_adv, exits_adv, (conflict_steps / max(1, steps))
+    return x_adv.detach(), linf, l2, preds_adv, exits_adv, (conflict_steps / max(1, steps)), snapshots_summary
 
 def list_candidate_model_names(models_path: str) -> List[str]:
     """列出 models_path 下可能的模型名称，并用 load_model 校验。"""
@@ -484,6 +576,9 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
     # Energy (pJ) trackers
     energy_clean_pj: List[float] = []
     energy_adv_pj: List[float] = []
+    # Maximum confidence trackers (for chosen exits)
+    maxconf_clean: List[float] = []
+    maxconf_adv: List[float] = []
 
     pbar = tqdm.tqdm(testloader, desc=f"{model_name}")
     # Pre-compute per-exit FLOPs (cumulative) using profiler if available
@@ -498,6 +593,28 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
             ops_per_exit[exit_id] = float(gflops) * 1e9
     except Exception:
         ops_per_exit = None
+
+    # Snapshot setup
+    snapshot_steps_set: set = set()
+    try:
+        if hasattr(args, 'snapshot_steps') and isinstance(args.snapshot_steps, str) and args.snapshot_steps.strip() != '':
+            snapshot_steps_set = set(int(s) for s in args.snapshot_steps.split(',') if s.strip() != '')
+        elif hasattr(args, 'snapshot_every') and int(getattr(args, 'snapshot_every', 0)) > 0:
+            ev = int(args.snapshot_every)
+            snapshot_steps_set = set(range(ev, int(args.pgd_steps) + 1, ev))
+    except Exception:
+        snapshot_steps_set = set()
+    # Accumulators for dataset-level snapshot metrics (attacked subset only)
+    snapshot_exit_counts = {int(k): [0] * (num_internal + 1) for k in sorted(list(snapshot_steps_set))}
+    snapshot_correct = {int(k): 0 for k in snapshot_exit_counts.keys()}
+    snapshot_total = {int(k): 0 for k in snapshot_exit_counts.keys()}
+    energy_clean_attacked_pj: List[float] = []
+    # Per-batch snapshot pairs (for plotting more granular curve): step -> list of dicts
+    step_pairs = {int(k): [] for k in sorted(list(snapshot_steps_set))}
+    combined_pairs = []  # across all steps and batches: list of (ratio, acc)
+
+    # Pre-compute exit-id -> block-count mapping
+    exit_to_blocks = _build_exit_to_blockcount(model)
     for imgs, labels in pbar:
         imgs = imgs.to(device)
         labels = labels.to(device)
@@ -513,6 +630,21 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
                 exits_clean = torch.full((batch_size,), 1, dtype=torch.long)
             final_out_clean = outputs_clean[-1] if isinstance(outputs_clean, list) else outputs_clean
             final_pred_clean = final_out_clean.argmax(dim=1)
+
+        # Max confidence distribution (clean) based on chosen exit logits
+        try:
+            if isinstance(outputs_clean, list):
+                for i in range(batch_size):
+                    eid = int(exits_clean[i].item())
+                    logits = outputs_clean[eid-1] if eid <= num_internal else outputs_clean[-1]
+                    probs_i = F.softmax(logits[i], dim=0)
+                    maxconf_clean.append(float(probs_i.max().item()))
+            else:
+                # single-head CNN fallback
+                probs = F.softmax(outputs_clean, dim=1)
+                maxconf_clean.extend(probs.max(dim=1)[0].detach().cpu().tolist())
+        except Exception:
+            pass
 
         # --- Clean energy (if profiler available) ---
         if ops_per_exit is not None:
@@ -553,7 +685,28 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
         imgs_correct = imgs[mask_idx]
         labels_correct = labels[mask_idx]
 
-        x_adv_subset, linf_vals, l2_vals, preds_adv_subset, exits_adv_subset, conflict_ratio = attack_batch(
+        # Gather clean energy for attacked subset (for global ratio denominator)
+        if ops_per_exit is not None:
+            for idx in mask_idx:
+                eid_clean = int(exits_clean[int(idx.item())].item()) if num_internal > 0 else 1
+                fl = ops_per_exit.get(eid_clean, None)
+                if fl is not None:
+                    energy_clean_attacked_pj.append(float(fl) * 3.2)
+        # Also gather per-batch denominator (mean clean energy for attacked subset in this batch)
+        batch_clean_den_pj = 0.0
+        batch_attacked_num = int(mask_idx.numel())
+        if ops_per_exit is not None and batch_attacked_num > 0:
+            e_sum_b = 0.0
+            for idx in mask_idx:
+                eid_clean = int(exits_clean[int(idx.item())].item()) if num_internal > 0 else 1
+                fl = ops_per_exit.get(eid_clean, None)
+                if fl is None:
+                    continue
+                e_sum_b += float(fl) * 3.2
+            if batch_attacked_num > 0:
+                batch_clean_den_pj = e_sum_b / float(batch_attacked_num)
+
+        x_adv_subset, linf_vals, l2_vals, preds_adv_subset, exits_adv_subset, conflict_ratio, snapshots_summary = attack_batch(
             model, imgs_correct, labels_correct,
             entropy_thresholds, eps, alpha, args.pgd_steps,
             lambda_exits,args.lambda_earlyexits, args.lambda_ce, args.lambda_l2,
@@ -565,7 +718,9 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
             pcgrad_mode=args.pcgrad_mode, pcgrad_partial=args.pcgrad_partial,
             pre_target_margin=args.pre_target_margin, pre_target_weight=args.pre_target_weight,
             pgd_update_mode=args.pgd_update_mode, pgd_momentum=args.pgd_momentum,
-            auto_balance_early=args.auto_balance_early, ab_target_ratio=args.ab_target_ratio
+            auto_balance_early=args.auto_balance_early, ab_target_ratio=args.ab_target_ratio,
+            snapshot_every=int(getattr(args, 'snapshot_every', 0)) if hasattr(args, 'snapshot_every') else 0,
+            snapshot_steps=[int(s) for s in sorted(list(snapshot_steps_set))] if snapshot_steps_set else None
         )
         # Weight by number of attacked samples in this batch
         attacked_count = imgs_correct.size(0)
@@ -584,6 +739,20 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
             final_out_adv = outputs_adv[-1] if isinstance(outputs_adv, list) else outputs_adv
             final_pred_adv = final_out_adv.argmax(dim=1)
 
+        # Max confidence distribution (adv) based on chosen exit logits
+        try:
+            if isinstance(outputs_adv, list):
+                for i in range(batch_size):
+                    eid = int(exits_adv_batch[i].item())
+                    logits = outputs_adv[eid-1] if eid <= num_internal else outputs_adv[-1]
+                    probs_i = F.softmax(logits[i], dim=0)
+                    maxconf_adv.append(float(probs_i.max().item()))
+            else:
+                probs = F.softmax(outputs_adv, dim=1)
+                maxconf_adv.extend(probs.max(dim=1)[0].detach().cpu().tolist())
+        except Exception:
+            pass
+
         # --- Adv energy (if profiler available) ---
         if ops_per_exit is not None:
             for e in exits_adv_batch:
@@ -592,6 +761,32 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
                 if fl is None:
                     continue
                 energy_adv_pj.append(float(fl) * 3.2)
+
+        # Accumulate snapshots for attacked subset
+        if snapshots_summary:
+            for k, sdict in snapshots_summary.items():
+                if int(k) not in snapshot_exit_counts:
+                    continue
+                counts_vec = sdict.get('exit_counts', [])
+                corr = int(sdict.get('correct', 0))
+                num_b = int(sdict.get('num', 0))
+                for i_c, cnt in enumerate(counts_vec):
+                    snapshot_exit_counts[int(k)][i_c] += int(cnt)
+                snapshot_correct[int(k)] += corr
+                snapshot_total[int(k)] += num_b
+                # Build per-batch pair for plotting: ratio vs acc
+                if ops_per_exit is not None and batch_attacked_num > 0 and batch_clean_den_pj > 0:
+                    energy_sum_step = 0.0
+                    for i_c, cnt in enumerate(counts_vec, start=1):
+                        fl = ops_per_exit.get(i_c, None)
+                        if fl is None:
+                            continue
+                        energy_sum_step += float(cnt) * float(fl) * 3.2
+                    mean_e_step = energy_sum_step / float(max(1, num_b))
+                    ratio_b = mean_e_step / batch_clean_den_pj if batch_clean_den_pj > 0 else 0.0
+                    acc_b = (float(corr) / float(max(1, num_b))) * 100.0
+                    step_pairs[int(k)].append({'ratio': float(ratio_b), 'acc': float(acc_b), 'n': int(num_b)})
+                    combined_pairs.append((float(ratio_b), float(acc_b)))
 
         # --- FLOPs-based recovery ratio per attacked sample (if profiler available) ---
         if ops_per_exit is not None and num_internal > 0:
@@ -634,6 +829,35 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
     adv_value = sum(cnt * i for i, cnt in enumerate(exit_counts_adv) if i > 0)
     dist_clean = exit_counts_clean[1 : num_internal + 2]
     dist_adv = exit_counts_adv[1 : num_internal + 2]
+    # EECScore from exit distributions (higher => earlier exits)
+    eec_clean = _compute_eec_score(dist_clean)
+    eec_adv = _compute_eec_score(dist_adv)
+    # Curve distances between cumulative early-exit curves
+    total_clean = float(sum(dist_clean)) if sum(dist_clean) > 0 else 1.0
+    total_adv = float(sum(dist_adv)) if sum(dist_adv) > 0 else 1.0
+    cum_clean = []
+    cum_adv = []
+    cc = 0.0
+    ca = 0.0
+    for k in range(len(dist_clean)):
+        cc += float(dist_clean[k]) / total_clean
+        ca += float(dist_adv[k]) / total_adv
+        cum_clean.append(cc)
+        cum_adv.append(ca)
+    haus_exitcdf, sspd_exitcdf = _compute_curve_distances(cum_clean, cum_adv)
+
+    # Avg computational blocks (by SDN layers traversed)
+    def _avg_blocks(dist: List[int]) -> float:
+        tot = float(sum(dist))
+        if tot <= 0:
+            return 0.0
+        val = 0.0
+        for i, cnt in enumerate(dist, start=1):
+            blocks = float(exit_to_blocks.get(i, len(model.layers)))
+            val += blocks * float(cnt)
+        return val / tot
+    avg_blocks_clean = _avg_blocks(dist_clean)
+    avg_blocks_adv = _avg_blocks(dist_adv)
     # Sanity checks for exit distribution counts
     clean_sum = int(sum(dist_clean))
     adv_sum = int(sum(dist_adv))
@@ -666,7 +890,41 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
     'pcgrad_conflict_frac': pc_conflict_fraction / max(1, pc_conflict_weight),
         'preferred_exit': int(args.prefer_exit) if args.prefer_exit is not None else None,
         'gradnorm': bool(args.gradnorm),
+        # EEC and curve distances
+        'eec_clean': eec_clean,
+        'eec_adv': eec_adv,
+        # Directional summary: larger late-area => more late exits (attack goal)
+        'late_exit_area_clean': (1.0 - eec_clean),
+        'late_exit_area_adv': (1.0 - eec_adv),
+        'late_exit_area_gain': (1.0 - eec_adv) - (1.0 - eec_clean),
+        # Signed delta (adv - clean) on EEC where lower implies later exits
+        'eec_delta': (eec_adv - eec_clean),
+        'haus_exitcdf': haus_exitcdf,
+        'sspd_exitcdf': sspd_exitcdf,
+        # Blocks-based complexity
+        'avg_blocks_clean': avg_blocks_clean,
+        'avg_blocks_adv': avg_blocks_adv,
     }
+    # Snapshot points: energy ratio (adv step / clean attacked) vs adv accuracy at step
+    if ops_per_exit is not None and snapshot_exit_counts and energy_clean_attacked_pj:
+        denom_e = sum(energy_clean_attacked_pj) / max(1, len(energy_clean_attacked_pj))
+        snap_points = []
+        for k in sorted(snapshot_exit_counts.keys()):
+            total_k = snapshot_total.get(int(k), 0)
+            if total_k <= 0:
+                continue
+            counts_vec = snapshot_exit_counts[int(k)]
+            energy_sum_k = 0.0
+            for i_c, cnt in enumerate(counts_vec, start=1):
+                fl = ops_per_exit.get(i_c, None)
+                if fl is None:
+                    continue
+                energy_sum_k += float(cnt) * float(fl) * 3.2
+            mean_e_k = energy_sum_k / float(total_k)
+            ratio = (mean_e_k / denom_e) if denom_e > 0 else 0.0
+            adv_acc_k = (float(snapshot_correct.get(int(k), 0)) / float(total_k)) * 100.0
+            snap_points.append({'step': int(k), 'energy_ratio': float(ratio), 'adv_acc': float(adv_acc_k)})
+        rec['snapshot_energy_acc_points'] = snap_points
     # Aggregate energy stats (pJ)
     if energy_clean_pj:
         rec['avg_energy_clean_pj'] = sum(energy_clean_pj) / len(energy_clean_pj) / 1e9
@@ -697,9 +955,64 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
     rec['frr_flops_count'] = len(frr_flops_vals)
     rec['frr_flops_mean'] = frr_mean
     rec['frr_flops_median'] = frr_median
+    # Max confidence summary
+    if maxconf_clean:
+        rec['maxconf_clean_mean'] = sum(maxconf_clean) / len(maxconf_clean)
+    else:
+        rec['maxconf_clean_mean'] = 0.0
+    if maxconf_adv:
+        rec['maxconf_adv_mean'] = sum(maxconf_adv) / len(maxconf_adv)
+    else:
+        rec['maxconf_adv_mean'] = 0.0
     if str(device).startswith('cuda'):
         del model
         torch.cuda.empty_cache()
+
+    # Plot combined per-batch snapshot curve if available
+    try:
+        if ops_per_exit is not None and combined_pairs:
+            # Step-mean pairs (weighted by batch size)
+            step_mean_pairs = []
+            for k, items in step_pairs.items():
+                if not items:
+                    continue
+                total_n = sum(it['n'] for it in items)
+                if total_n <= 0:
+                    continue
+                mean_ratio = sum(it['ratio'] * it['n'] for it in items) / float(total_n)
+                mean_acc = sum(it['acc'] * it['n'] for it in items) / float(total_n)
+                step_mean_pairs.append((mean_ratio, mean_acc, k))
+            # Prepare plot
+            pairs_sorted = sorted(combined_pairs, key=lambda t: t[0])
+            xs = [p[0] for p in pairs_sorted]
+            ys = [p[1] for p in pairs_sorted]
+            sm_sorted = sorted(step_mean_pairs, key=lambda t: t[0])
+            xs_m = [p[0] for p in sm_sorted]
+            ys_m = [p[1] for p in sm_sorted]
+            plt.figure(figsize=(7.2, 5.0), dpi=140)
+            # scatter of all batch points
+            plt.scatter(xs, ys, s=14, alpha=0.35, label='batches')
+            # line of step means
+            if xs_m:
+                plt.plot(xs_m, ys_m, '-o', color='#d62728', linewidth=2, markersize=4, label='step mean')
+            # baseline clean point
+            plt.scatter([1.0], [rec['clean_final_acc']], color='#2ca02c', s=30, label='clean (x=1)')
+            plt.xlabel('Relative energy (adv / clean)')
+            plt.ylabel('Accuracy (%)')
+            plt.title(f"{model_name}: Acc vs Relative Energy")
+            plt.grid(True, linestyle='--', alpha=0.35)
+            plt.legend(loc='best', fontsize=8)
+            os.makedirs(os.path.join(args.out_dir, 'plots'), exist_ok=True)
+            ts_tag = datetime.now().strftime('%Y%m%d_%H%M%S')
+            safe_name = ''.join(c if c.isalnum() or c in ('-','_') else '_' for c in model_name)
+            out_png = os.path.join(args.out_dir, 'plots', f'{safe_name}_acc_vs_rel_energy_{ts_tag}.png')
+            plt.tight_layout()
+            plt.savefig(out_png)
+            plt.close()
+            print(f"Saved per-batch energy-accuracy curve: {out_png}")
+            rec['acc_vs_energy_png'] = out_png
+    except Exception as e:
+        print(f"[WARN] Failed to plot per-batch energy curve: {e}")
     return rec
 
 
@@ -714,7 +1027,15 @@ def save_attack_summary(records: List[dict], out_dir='outputs/test_results'):
         'clean_final_acc','adv_final_acc','avg_exit_clean','avg_exit_adv','avg_linf','avg_l2',
         'thresholds','lambda_exits','exit_dist_clean','exit_dist_adv','pcgrad_conflict_frac',
         'avg_energy_clean_pj','avg_energy_adv_pj','energy_ratio_adv_over_clean',
-        'frr_flops_count','frr_flops_mean','frr_flops_median','preferred_exit','gradnorm'
+        'frr_flops_count','frr_flops_mean','frr_flops_median',
+        # Early-exit curve metrics
+        'eec_clean','eec_adv','eec_delta','late_exit_area_clean','late_exit_area_adv','late_exit_area_gain','haus_exitcdf','sspd_exitcdf',
+        # Blocks-based complexity
+        'avg_blocks_clean','avg_blocks_adv',
+        # Confidence stats
+        'maxconf_clean_mean','maxconf_adv_mean',
+        'snapshot_energy_acc_points','acc_vs_energy_png',
+        'preferred_exit','gradnorm'
     ]
     with open(csv_path, 'w', newline='') as f:
         wr = csv.DictWriter(f, fieldnames=fields)
@@ -732,6 +1053,8 @@ def save_attack_summary(records: List[dict], out_dir='outputs/test_results'):
             eda = r.get('exit_dist_adv', [])
             row['exit_dist_clean'] = ','.join(str(int(x)) for x in edc)
             row['exit_dist_adv'] = ','.join(str(int(x)) for x in eda)
+            snaps = r.get('snapshot_energy_acc_points', []) or []
+            row['snapshot_energy_acc_points'] = ';'.join(f"{int(p.get('step',0))}:{float(p.get('energy_ratio',0.0)):.6f}:{float(p.get('adv_acc',0.0)):.3f}" for p in snaps)
             wr.writerow(row)
 
     with open(md_path, 'w') as f:
@@ -744,6 +1067,16 @@ def save_attack_summary(records: List[dict], out_dir='outputs/test_results'):
             f.write(f"  - Norms (Linf/L2): {r['avg_linf']:.6f} / {r['avg_l2']:.6f}\n")
             f.write(f"  - Energy (pJ) avg (clean/adv): {r.get('avg_energy_clean_pj',0.0):.3f} / {r.get('avg_energy_adv_pj',0.0):.3f}\n")
             f.write(f"  - Energy ratio (adv/clean): {r.get('energy_ratio_adv_over_clean',0.0):.4f}\n")
+            f.write(f"  - EECScore (clean/adv): {r.get('eec_clean',0.0):.4f} / {r.get('eec_adv',0.0):.4f}  (delta={r.get('eec_delta',0.0):.4f})\n")
+            f.write(f"  - Late-Exit Area (clean/adv): {r.get('late_exit_area_clean',0.0):.4f} / {r.get('late_exit_area_adv',0.0):.4f}  (gain={r.get('late_exit_area_gain',0.0):.4f})\n")
+            f.write(f"  - Early-exit curve distances (Haus/SSPD): {r.get('haus_exitcdf',0.0):.4f} / {r.get('sspd_exitcdf',0.0):.4f}\n")
+            f.write(f"  - Avg blocks (SDN layers) clean/adv: {r.get('avg_blocks_clean',0.0):.2f} / {r.get('avg_blocks_adv',0.0):.2f}\n")
+            f.write(f"  - Max confidence mean (clean/adv): {r.get('maxconf_clean_mean',0.0):.4f} / {r.get('maxconf_adv_mean',0.0):.4f}\n")
+            snaps = r.get('snapshot_energy_acc_points', []) or []
+            if snaps:
+                f.write("  - Snapshot energy-ratio vs adv-acc points (step:ratio->acc%):\n")
+                for p in snaps:
+                    f.write(f"    - s{int(p.get('step',0))}: {float(p.get('energy_ratio',0.0)):.4f} -> {float(p.get('adv_acc',0.0)):.2f}%\n")
             ths = r.get('thresholds', [])
             f.write(f"  - Thresholds: {','.join(f'{x:.2f}' for x in ths) if ths else '-'}\n\n")
             if r.get('num_exits', 1) > 1:
@@ -794,6 +1127,8 @@ def main():
     parser.add_argument('--pgd_momentum', type=float, default=0.9, help='PGD 动量项系数，0禁用')
     parser.add_argument('--auto_balance_early', action='store_true', default=False, help='按梯度范数比自适应缩放早期损失')
     parser.add_argument('--ab_target_ratio', type=float, default=1.0, help='自适应缩放目标：||g_early|| ≈ ab_target_ratio * ||g_acc||')
+    parser.add_argument('--snapshot_every', type=int, default=4, help='PGD 步长间隔进行一次快照 (能耗/精度)，0=禁用')
+    parser.add_argument('--snapshot_steps', type=str, default=None, help='逗号分隔的具体 PGD 步编号(1-based)进行快照，优先级高于 snapshot_every')
     args = parser.parse_args()
 
     global device
