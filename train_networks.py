@@ -135,10 +135,11 @@ def train_models(models_path, device='cpu', tasks = ['tinyimagenet','cifar10', '
     sdns = []
 
     for task in tasks:
-        af.extend_lists(cnns, sdns, arcs.create_vgg16bn(models_path, task, save_type='cd'))
-        af.extend_lists(cnns, sdns, arcs.create_resnet56(models_path, task, save_type='cd'))
-        af.extend_lists(cnns, sdns, arcs.create_wideresnet32_4(models_path, task, save_type='cd'))
-        af.extend_lists(cnns, sdns, arcs.create_mobilenet(models_path, task, save_type='cd'))
+        #af.extend_lists(cnns, sdns, arcs.create_vgg16bn(models_path, task, save_type='cd'))
+        #af.extend_lists(cnns, sdns, arcs.create_resnet56(models_path, task, save_type='cd'))
+        af.extend_lists(cnns, sdns, arcs.create_resnet110(models_path, task, save_type='cd'))
+        #af.extend_lists(cnns, sdns, arcs.create_wideresnet32_4(models_path, task, save_type='cd'))
+        #af.extend_lists(cnns, sdns, arcs.create_mobilenet(models_path, task, save_type='cd'))
 
     train(models_path, cnns, sdn=False, device=device, scheduler_type=scheduler_type,
         resume=resume_cnn, resume_epochs=resume_epochs, resume_lr=resume_lr)

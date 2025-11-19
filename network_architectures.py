@@ -119,6 +119,32 @@ def create_resnet56(models_path, task, save_type, get_params=False):
     return save_networks(model_name, model_params, models_path, save_type)
 
 
+def create_resnet110(models_path, task, save_type, get_params=False):
+    print('Creating resnet110 untrained {} models...'.format(task))
+    model_params = get_task_params(task)
+    model_params['block_type'] = 'basic'
+    # CIFAR ResNet-110: depth = 6n+2 -> n=18 per stage
+    model_params['num_blocks'] = [18, 18, 18]
+    # Place 6 ICs roughly evenly across depth: two per stage
+    # Each sublist corresponds to the stage's blocks; length must match num_blocks[stage]
+    stage_ic = [0,0,0,0,0,0,1,0,0,0,0,0,1,0,0,0,0,0]
+    model_params['add_ic'] = [stage_ic.copy(), stage_ic.copy(), stage_ic.copy()]
+
+    model_name = '{}_resnet110'.format(task)
+
+    model_params['network_type'] = 'resnet110'
+    model_params['augment_training'] = True
+    model_params['init_weights'] = True
+
+    get_lr_params(model_params)
+    
+
+    if get_params:
+        return model_params
+
+    return save_networks(model_name, model_params, models_path, save_type)
+
+
 def create_wideresnet32_4(models_path, task, save_type, get_params=False):
     print('Creating wrn32_4 untrained {} models...'.format(task))
     model_params = get_task_params(task)
@@ -334,6 +360,8 @@ def get_net_params(net_type, task):
         return create_vgg16bn(None, task,  None, True)
     elif net_type == 'resnet56':
         return create_resnet56(None, task,  None, True)
+    elif net_type == 'resnet110':
+        return create_resnet110(None, task,  None, True)
     elif net_type == 'wideresnet32_4':
         return create_wideresnet32_4(None, task,  None, True)
     elif net_type == 'mobilenet':

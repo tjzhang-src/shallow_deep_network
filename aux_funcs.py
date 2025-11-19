@@ -132,7 +132,7 @@ class InternalClassifier(nn.Module):
 def get_random_seed():
     """Return the active random seed. Defaults to 4221 unless overridden."""
     global _CUSTOM_SEED
-    return _CUSTOM_SEED if _CUSTOM_SEED is not None else 5221  # 121 and 1221
+    return _CUSTOM_SEED if _CUSTOM_SEED is not None else 6221  # 121 and 1221
 
 def get_subsets(input_list, sset_size):
     return list(it.combinations(input_list, sset_size))

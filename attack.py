@@ -200,6 +200,7 @@ def attack_batch(model, x, y, thresholds, eps, alpha, steps, lambda_exits, lambd
                  pgd_momentum: float = 0.0,
                  auto_balance_early: bool = False,
                  ab_target_ratio: float = 1.0,
+                 grad_select: str = 'none',
                  snapshot_every: int = 0,
                  snapshot_steps: Optional[List[int]] = None):
     """对 batch 做 constrained PGD，返回 (x_adv, linf, l2, preds_adv, exits_adv, pcgrad_conflict_count)
@@ -407,8 +408,32 @@ def attack_batch(model, x, y, thresholds, eps, alpha, steps, lambda_exits, lambd
                     scale_early = float(ab_target_ratio) * float(norm_acc) / float(norm_early)
                     # keep within a sane range
                     scale_early = float(max(0.1, min(10.0, scale_early)))
-            total_loss = (scale_early * (loss_early_total * lambda_earlyexits)) + (lambda_ce * loss_ce_term) + (lambda_l2 * loss_l2_term)
-            grads = torch.autograd.grad(total_loss, delta, retain_graph=False)[0]
+            # Compute individual grads (scaled) to optionally select/merge
+            loss_acc_scaled2 = (lambda_ce * loss_ce_term)
+            loss_early_scaled2 = (scale_early * (lambda_earlyexits * loss_early_total))
+            g_acc2 = torch.autograd.grad(loss_acc_scaled2, delta, retain_graph=True)[0]
+            if early_losses:
+                g_early2 = torch.autograd.grad(loss_early_scaled2, delta, retain_graph=True)[0]
+            else:
+                g_early2 = torch.zeros_like(delta)
+            g_reg2 = torch.autograd.grad(lambda_l2 * loss_l2_term, delta)[0]
+
+            if isinstance(grad_select, str):
+                mode = grad_select.lower()
+            else:
+                mode = 'none'
+
+            if mode == 'max_norm' and early_losses:
+                # Choose the task gradient with larger mean L2 norm (batch-averaged)
+                n_acc = g_acc2.view(g_acc2.size(0), -1).norm(p=2, dim=1).mean()
+                n_early = g_early2.view(g_early2.size(0), -1).norm(p=2, dim=1).mean()
+                grads = (g_early2 if float(n_early) >= float(n_acc) else g_acc2) + g_reg2
+            elif mode == 'max_element' and early_losses:
+                # Element-wise select the larger magnitude component from the two task grads
+                grads = torch.where(g_acc2.abs() >= g_early2.abs(), g_acc2, g_early2) + g_reg2
+            else:
+                # Default: sum the two objectives (with auto-balancing if enabled)
+                grads = g_acc2 + g_early2 + g_reg2
 
         # PGD 更新（最小化 loss），在归一化空间按通道尺度更新与投影
         # Apply momentum if enabled
@@ -718,7 +743,7 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
             pcgrad_mode=args.pcgrad_mode, pcgrad_partial=args.pcgrad_partial,
             pre_target_margin=args.pre_target_margin, pre_target_weight=args.pre_target_weight,
             pgd_update_mode=args.pgd_update_mode, pgd_momentum=args.pgd_momentum,
-            auto_balance_early=args.auto_balance_early, ab_target_ratio=args.ab_target_ratio,
+            auto_balance_early=args.auto_balance_early, ab_target_ratio=args.ab_target_ratio, grad_select=args.grad_select,
             snapshot_every=int(getattr(args, 'snapshot_every', 0)) if hasattr(args, 'snapshot_every') else 0,
             snapshot_steps=[int(s) for s in sorted(list(snapshot_steps_set))] if snapshot_steps_set else None
         )
@@ -1107,7 +1132,7 @@ def main():
     parser.add_argument('--cw', action='store_true', default=False, help='使用 CW 风格保持正确 (默认 False=CE)')
     parser.add_argument('--c', type=float, default=0.1, help='CW 系数 c')
     parser.add_argument('--kappa', type=float, default=3, help='CW 置信度 margin')
-    parser.add_argument('--pcgrad', action='store_true', help='是否使用 PCGrad', default=True)
+    parser.add_argument('--pcgrad', action='store_true', help='是否使用 PCGrad', default=False)
     parser.add_argument('--pcgrad_mode', type=str, choices=['one-sided','symmetric'], default='symmetric', help='PCGrad 投影方式：单边/对称')
     parser.add_argument('--pcgrad_partial', type=float, default=1.0, help='PCGrad 投影强度比例 [0,1]，1为完全投影')
     parser.add_argument('--gradnorm', action='store_true', help='是否使用 GradNorm 解决多目标梯度冲突', default=False)
@@ -1127,6 +1152,8 @@ def main():
     parser.add_argument('--pgd_momentum', type=float, default=0.9, help='PGD 动量项系数，0禁用')
     parser.add_argument('--auto_balance_early', action='store_true', default=False, help='按梯度范数比自适应缩放早期损失')
     parser.add_argument('--ab_target_ratio', type=float, default=1.0, help='自适应缩放目标：||g_early|| ≈ ab_target_ratio * ||g_acc||')
+    parser.add_argument('--grad_select', type=str, choices=['none','max_norm','max_element'], default='none',
+                        help='梯度合成方式：none=加和(默认，可配合auto_balance_early)；max_norm=在两者中选择范数更大的；max_element=逐元素选择绝对值更大的。')
     parser.add_argument('--snapshot_every', type=int, default=4, help='PGD 步长间隔进行一次快照 (能耗/精度)，0=禁用')
     parser.add_argument('--snapshot_steps', type=str, default=None, help='逗号分隔的具体 PGD 步编号(1-based)进行快照，优先级高于 snapshot_every')
     args = parser.parse_args()
