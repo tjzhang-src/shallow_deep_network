@@ -201,6 +201,8 @@ def attack_batch(model, x, y, thresholds, eps, alpha, steps, lambda_exits, lambd
                  auto_balance_early: bool = False,
                  ab_target_ratio: float = 1.0,
                  grad_select: str = 'none',
+                 gdw: bool = False,
+                 gdw_eps: float = 1e-6,
                  snapshot_every: int = 0,
                  snapshot_steps: Optional[List[int]] = None):
     """对 batch 做 constrained PGD，返回 (x_adv, linf, l2, preds_adv, exits_adv, pcgrad_conflict_count)
@@ -241,10 +243,14 @@ def attack_batch(model, x, y, thresholds, eps, alpha, steps, lambda_exits, lambd
     # GradNorm state (for two tasks: accuracy and early-exit). Initialize on demand
     use_two_tasks = False
     if (lambda_earlyexits > 0.0) and (len(lambda_exits) > 0) and (len(lambda_exits) == (model.num_output - 1 if hasattr(model, 'num_output') else 0)):
+        #print("true")
         use_two_tasks = True
     if gradnorm and not use_two_tasks:
         # No early-exit loss -> GradNorm degenerates to single task; disable
         gradnorm = False
+    if gdw and not use_two_tasks:
+        # No early-exit loss -> GDW degenerates to single task; disable
+        gdw = False
     # holders
     w = None
     opt_w = None
@@ -338,6 +344,28 @@ def attack_batch(model, x, y, thresholds, eps, alpha, steps, lambda_exits, lambd
                     proj_early = g_early
                 g_acc, g_early = proj_acc, proj_early
             grads = g_acc + g_early + g_reg
+        elif gdw and early_losses:
+            # GDW: Gradient-magnitude based Dynamic Weighting
+            # w_i = 1 / (||grad_i|| + eps) to balance task contributions
+            g_acc = torch.autograd.grad(lambda_ce * loss_ce_term, delta, retain_graph=True)[0]
+            g_early = torch.autograd.grad(lambda_earlyexits * loss_early_total, delta, retain_graph=True)[0]
+            g_reg = torch.autograd.grad(lambda_l2 * loss_l2_term, delta)[0]
+            
+            # Compute gradient norms (mean L2 norm per sample)
+            norm_acc = g_acc.view(g_acc.size(0), -1).norm(p=2, dim=1).mean()
+            norm_early = g_early.view(g_early.size(0), -1).norm(p=2, dim=1).mean()
+            
+            # Inverse norm weights: large gradient -> small weight
+            w_acc = 1.0 / (float(norm_acc) + float(gdw_eps))
+            w_early = 1.0 / (float(norm_early) + float(gdw_eps))
+            
+            # Normalize weights to sum to 2 (matching default equal weighting)
+            w_sum = w_acc + w_early
+            if w_sum > 0:
+                w_acc = (2.0 * w_acc) / w_sum
+                w_early = (2.0 * w_early) / w_sum
+            
+            grads = w_acc * g_acc + w_early * g_early + g_reg
         elif gradnorm and early_losses:
             # lazy init for GradNorm weights/optimizer
             if w is None:
@@ -744,6 +772,7 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
             pre_target_margin=args.pre_target_margin, pre_target_weight=args.pre_target_weight,
             pgd_update_mode=args.pgd_update_mode, pgd_momentum=args.pgd_momentum,
             auto_balance_early=args.auto_balance_early, ab_target_ratio=args.ab_target_ratio, grad_select=args.grad_select,
+            gdw=args.gdw, gdw_eps=args.gdw_eps,
             snapshot_every=int(getattr(args, 'snapshot_every', 0)) if hasattr(args, 'snapshot_every') else 0,
             snapshot_steps=[int(s) for s in sorted(list(snapshot_steps_set))] if snapshot_steps_set else None
         )
@@ -915,6 +944,7 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
     'pcgrad_conflict_frac': pc_conflict_fraction / max(1, pc_conflict_weight),
         'preferred_exit': int(args.prefer_exit) if args.prefer_exit is not None else None,
         'gradnorm': bool(args.gradnorm),
+        'gdw': bool(args.gdw),
         # EEC and curve distances
         'eec_clean': eec_clean,
         'eec_adv': eec_adv,
@@ -1060,7 +1090,7 @@ def save_attack_summary(records: List[dict], out_dir='outputs/test_results'):
         # Confidence stats
         'maxconf_clean_mean','maxconf_adv_mean',
         'snapshot_energy_acc_points','acc_vs_energy_png',
-        'preferred_exit','gradnorm'
+        'preferred_exit','gradnorm','gdw'
     ]
     with open(csv_path, 'w', newline='') as f:
         wr = csv.DictWriter(f, fieldnames=fields)
@@ -1138,6 +1168,8 @@ def main():
     parser.add_argument('--gradnorm', action='store_true', help='是否使用 GradNorm 解决多目标梯度冲突', default=False)
     parser.add_argument('--gradnorm_alpha', type=float, default=1.0, help='GradNorm 的 alpha 超参数')
     parser.add_argument('--gradnorm_lr', type=float, default=1e-3, help='GradNorm 中对权重 w 的学习率')
+    parser.add_argument('--gdw', action='store_true', help='是否使用 GDW (Gradient-magnitude based Dynamic Weighting) 平衡多目标梯度', default=False)
+    parser.add_argument('--gdw_eps', type=float, default=1e-6, help='GDW 权重计算中的 epsilon (防止除零)')
     parser.add_argument('--same_acc_early_loss_value', default=False, action='store_true', help='使用和原始示例相似的早期分支负交叉熵法')
     parser.add_argument('--device', type=str, default='cuda:2', help='手动指定设备，如 cuda:0')
     parser.add_argument('--only', nargs='*', help='仅评测这些模型名（可多个）')
