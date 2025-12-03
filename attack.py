@@ -204,6 +204,11 @@ def attack_batch(model, x, y, thresholds, eps, alpha, steps, lambda_exits, lambd
                  gdw: bool = False,
                  gdw_eps: float = 1e-6,
                  pcgrad_gdw_order: str = 'pcgrad_first',
+                 maintain_early_accuracy: bool = False,
+                 maintain_early_acc_weight: float = 0.5,
+                 adaptive_exit_strategy: bool = False,
+                 adaptive_start_ratio: float = 0.75,
+                 adaptive_acc_weight: float = 1.0,
                  snapshot_every: int = 0,
                  snapshot_steps: Optional[List[int]] = None):
     """对 batch 做 constrained PGD，返回 (x_adv, linf, l2, preds_adv, exits_adv, pcgrad_conflict_count)
@@ -290,12 +295,41 @@ def attack_batch(model, x, y, thresholds, eps, alpha, steps, lambda_exits, lambd
             # - 对于 i < target: 提高熵，避免更早出口 -> hinge(t - nent, 0)
             # - 对于 i == target: 降低熵，触发该出口 -> hinge(nent - t, 0)
             # - 对于 i > target: 不约束（已不会到达）
+            
+            # 自适应策略：在最后1/4的PGD步骤中，检测对抗样本想要使用的早退层
+            # 根据出口位置采用不同策略：前半部分加大约束防止早退，后半部分维持精度
+            adaptive_early_exits = []  # 前半部分低于阈值的出口
+            adaptive_late_exits = []   # 后半部分低于阈值的出口
+            if adaptive_exit_strategy and step_idx >= int(steps * adaptive_start_ratio):
+                num_internal = len(internal_outputs)
+                mid_point = num_internal // 2
+                
+                for i, logits in enumerate(internal_outputs):
+                    nent = normalized_entropy_from_logits(logits).mean().item()
+                    t = thresholds[i] if i < len(thresholds) else (thresholds[-1] if len(thresholds) > 0 else 0.0)
+                    if nent < t:
+                        exit_idx = i + 1  # 1-based
+                        if i < mid_point:
+                            # 前半部分出口：需要加大约束防止早退
+                            adaptive_early_exits.append(exit_idx)
+                        else:
+                            # 后半部分出口：维持精度
+                            adaptive_late_exits.append(exit_idx)
+            
             target = prefer_exit_id if (prefer_exit_id is not None and prefer_exit_id >= 1) else None
             for i, logits in enumerate(internal_outputs):
                 nent = normalized_entropy_from_logits(logits)
                 t = thresholds[i] if i < len(thresholds) else (thresholds[-1] if len(thresholds) > 0 else 0.0)
                 exit_idx = i + 1  # 1-based for internal
-                if target is None:
+                
+                # 自适应策略：根据出口位置和熵值采用不同约束
+                if exit_idx in adaptive_early_exits:
+                    # 前半部分低于阈值的出口：加大熵约束权重，防止过早退出
+                    early_losses.append(adaptive_acc_weight * torch.clamp(t - nent, min=0.0).mean())
+                elif exit_idx in adaptive_late_exits:
+                    # 后半部分低于阈值的出口：维持该层精度
+                    early_losses.append(F.cross_entropy(logits, y) * adaptive_acc_weight)
+                elif target is None:
                     # 默认策略：整体提高早期熵，推动更晚退出
                     early_losses.append(torch.clamp(t - nent, min=0.0).mean())
                 else:
@@ -872,6 +906,9 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
             auto_balance_early=args.auto_balance_early, ab_target_ratio=args.ab_target_ratio, grad_select=args.grad_select,
             gdw=args.gdw, gdw_eps=args.gdw_eps,
             pcgrad_gdw_order=args.pcgrad_gdw_order,
+            adaptive_exit_strategy=args.adaptive_exit_strategy,
+            adaptive_start_ratio=args.adaptive_start_ratio,
+            adaptive_acc_weight=args.adaptive_acc_weight,
             snapshot_every=int(getattr(args, 'snapshot_every', 0)) if hasattr(args, 'snapshot_every') else 0,
             snapshot_steps=[int(s) for s in sorted(list(snapshot_steps_set))] if snapshot_steps_set else None
         )
@@ -1252,33 +1289,33 @@ def main():
     parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--entropy_thresholds', type=str, default='0.20,0.20,0.30,0.3,0.35,0.35', help='逗号分隔，对应每个内部出口')
     parser.add_argument('--lambda_exits', type=str, default="1,0.9,0.8,0.7,0.6,0.5,0.4", help='逗号分隔，对应各内部出口权重；缺省=全部1.0')
-    parser.add_argument('--lambda_earlyexits', type=float, default=160)
+    parser.add_argument('--lambda_earlyexits', type=float, default=20)
     parser.add_argument('--lambda_ce', type=float, default=1)
     parser.add_argument('--lambda_l2', type=float, default=0.01)
     parser.add_argument('--eps', type=str, default='8/255')
     parser.add_argument('--alpha', type=str, default='2/255')
-    parser.add_argument('--pgd_steps', type=int, default=20)
+    parser.add_argument('--pgd_steps', type=int, default=40)
     parser.add_argument('--cw', action='store_true', default=False, help='使用 CW 风格保持正确 (默认 False=CE)')
     parser.add_argument('--c', type=float, default=0.1, help='CW 系数 c')
     parser.add_argument('--kappa', type=float, default=3, help='CW 置信度 margin')
-    parser.add_argument('--pcgrad', action='store_true', help='是否使用 PCGrad', default=True)
+    parser.add_argument('--pcgrad', action='store_true', help='是否使用 PCGrad', default=False)
     parser.add_argument('--pcgrad_mode', type=str, choices=['one-sided','symmetric'], default='symmetric', help='PCGrad 投影方式：单边/对称')
     parser.add_argument('--pcgrad_partial', type=float, default=1.0, help='PCGrad 投影强度比例 [0,1]，1为完全投影')
     parser.add_argument('--gradnorm', action='store_true', help='是否使用 GradNorm 解决多目标梯度冲突', default=False)
     parser.add_argument('--gradnorm_alpha', type=float, default=1.0, help='GradNorm 的 alpha 超参数')
     parser.add_argument('--gradnorm_lr', type=float, default=1e-3, help='GradNorm 中对权重 w 的学习率')
-    parser.add_argument('--gdw', action='store_true', help='是否使用 GDW (Gradient-magnitude based Dynamic Weighting) 平衡多目标梯度', default=True)
+    parser.add_argument('--gdw', action='store_true', help='是否使用 GDW (Gradient-magnitude based Dynamic Weighting) 平衡多目标梯度', default=False)
     parser.add_argument('--gdw_eps', type=float, default=1e-6, help='GDW 权重计算中的 epsilon (防止除零)')
     parser.add_argument('--pcgrad_gdw_order', type=str, choices=['pcgrad_first', 'gdw_first'], default='gdw_first', 
                         help='当同时使用PCGrad和GDW时的执行顺序：pcgrad_first=先投影再平衡(默认), gdw_first=先平衡再投影')
     parser.add_argument('--same_acc_early_loss_value', default=False, action='store_true', help='使用和原始示例相似的早期分支负交叉熵法')
-    parser.add_argument('--device', type=str, default='cuda:5', help='手动指定设备，如 cuda:0')
+    parser.add_argument('--device', type=str, default='cuda:1', help='手动指定设备，如 cuda:0')
     parser.add_argument('--only', nargs='*', help='仅评测这些模型名（可多个）')
     parser.add_argument('--skip', nargs='*', default=[], help='跳过这些模型名')
-    parser.add_argument('--skip_contains', nargs='*', default=["cnn","cifar10", "training"], help='排除名字中包含这些子串的模型（多值 OR）')
+    parser.add_argument('--skip_contains', nargs='*', default=["cnn","cifar10_","imagenet", "training"], help='排除名字中包含这些子串的模型（多值 OR）')
     parser.add_argument('--pre_target_margin', type=float, default=0.1, help='在目标出口之前的层，额外增加的熵阈值裕量 (默认0不启用)')
     parser.add_argument('--pre_target_weight', type=float, default=1.0, help='目标之前层的约束权重(乘子)')
-    parser.add_argument('--prefer_exit', type=int, default=7, help='攻击时倾向让样本在该出口退出（1..N；N为最终出口）')
+    parser.add_argument('--prefer_exit', type=int, default=0, help='攻击时倾向让样本在该出口退出（1..N；N为最终出口）')
     parser.add_argument('--out_dir', type=str, default='outputs/test_results', help='导出结果目录')
     # PGD update options
     parser.add_argument('--pgd_update_mode', type=str, choices=['linf_sign','l2_dir','linf_projected_dir'], default='l2_dir', help='PGD 更新方向：Linf-sign 或 L2 方向（保留Linf投影）')
@@ -1289,6 +1326,12 @@ def main():
                         help='梯度合成方式：none=加和(默认，可配合auto_balance_early)；max_norm=在两者中选择范数更大的；max_element=逐元素选择绝对值更大的。')
     parser.add_argument('--snapshot_every', type=int, default=4, help='PGD 步长间隔进行一次快照 (能耗/精度)，0=禁用')
     parser.add_argument('--snapshot_steps', type=str, default=None, help='逗号分隔的具体 PGD 步编号(1-based)进行快照，优先级高于 snapshot_every')
+    parser.add_argument('--adaptive_exit_strategy', action='store_true', default=False, 
+                        help='启用自适应出口策略：在最后1/4的PGD步骤中检测对抗样本想要使用的早退层，对该层使用精度约束而非熵约束')
+    parser.add_argument('--adaptive_start_ratio', type=float, default=0.85, 
+                        help='自适应策略开始的步骤比例 (默认0.75，即最后25%的步骤)')
+    parser.add_argument('--adaptive_acc_weight', type=float, default=1.0, 
+                        help='自适应策略中精度约束的权重系数')
     args = parser.parse_args()
 
     global device
