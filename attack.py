@@ -203,6 +203,7 @@ def attack_batch(model, x, y, thresholds, eps, alpha, steps, lambda_exits, lambd
                  grad_select: str = 'none',
                  gdw: bool = False,
                  gdw_eps: float = 1e-6,
+                 pcgrad_gdw_order: str = 'pcgrad_first',
                  snapshot_every: int = 0,
                  snapshot_steps: Optional[List[int]] = None):
     """对 batch 做 constrained PGD，返回 (x_adv, linf, l2, preds_adv, exits_adv, pcgrad_conflict_count)
@@ -239,6 +240,9 @@ def attack_batch(model, x, y, thresholds, eps, alpha, steps, lambda_exits, lambd
         lambda_exits = lambda_exits[:num_internal]
 
     conflict_steps = 0
+    # Diagnostic counters for understanding gradient behavior
+    total_steps_checked = 0
+    gdw_weight_ratios = []  # Track GDW weight distribution
 
     # GradNorm state (for two tasks: accuracy and early-exit). Initialize on demand
     use_two_tasks = False
@@ -327,7 +331,91 @@ def attack_batch(model, x, y, thresholds, eps, alpha, steps, lambda_exits, lambd
 
         loss_l2_term = (delta.view(batch_size, -1).norm(p=2, dim=1).mean())
 
-        if pcgrad and early_losses:
+        if pcgrad and gdw and early_losses:
+            # Combined PCGrad + GDW with configurable order
+            g_acc_orig = torch.autograd.grad(loss_ce_term * lambda_ce, delta, retain_graph=True)[0]
+            g_early_orig = torch.autograd.grad(loss_early_total * lambda_earlyexits, delta, retain_graph=True)[0]
+            g_reg = torch.autograd.grad(lambda_l2 * loss_l2_term, delta)[0]
+            
+            # Diagnostic: track gradient statistics
+            total_steps_checked += 1
+            
+            if pcgrad_gdw_order == 'gdw_first':
+                # Order: GDW first (balance magnitudes), then PCGrad (resolve conflicts)
+                # Stage 1: GDW magnitude balancing on original gradients
+                norm_acc = g_acc_orig.view(g_acc_orig.size(0), -1).norm(p=2, dim=1).mean()
+                norm_early = g_early_orig.view(g_early_orig.size(0), -1).norm(p=2, dim=1).mean()
+                
+                # Inverse norm weights: large gradient -> small weight
+                w_acc = 1.0 / (float(norm_acc) + float(gdw_eps))
+                w_early = 1.0 / (float(norm_early) + float(gdw_eps))
+                
+                # Normalize weights to sum to 2
+                w_sum = w_acc + w_early
+                if w_sum > 0:
+                    w_acc = (2.0 * w_acc) / w_sum
+                    w_early = (2.0 * w_early) / w_sum
+                
+                # Track weight ratio for diagnostics
+                gdw_weight_ratios.append(w_acc / max(w_early, 1e-12))
+                
+                # Apply GDW weights
+                g_acc = w_acc * g_acc_orig
+                g_early = w_early * g_early_orig
+                
+                # Stage 2: PCGrad conflict resolution on weighted gradients
+                # Check conflict on ORIGINAL gradients but apply on weighted ones
+                dot_orig = torch.dot(g_acc_orig.flatten(), g_early_orig.flatten())
+                if dot_orig < 0:
+                    conflict_steps += 1
+                    # Now apply projection on the weighted gradients
+                    denom_e = (g_early.flatten().norm() ** 2 + 1e-12)
+                    denom_a = (g_acc.flatten().norm() ** 2 + 1e-12)
+                    dot_weighted = torch.dot(g_acc.flatten(), g_early.flatten())
+                    proj_acc = g_acc - pcgrad_partial * (dot_weighted / denom_e) * g_early
+                    if pcgrad_mode == 'symmetric':
+                        proj_early = g_early - pcgrad_partial * (dot_weighted / denom_a) * g_acc
+                    else:
+                        proj_early = g_early
+                    g_acc, g_early = proj_acc, proj_early
+                
+                grads = g_acc + g_early + g_reg
+            else:
+                # Order: PCGrad first (resolve conflicts), then GDW (balance magnitudes)
+                # Stage 1: PCGrad conflict resolution on original gradients
+                g_acc = g_acc_orig
+                g_early = g_early_orig
+                dot = torch.dot(g_acc.flatten(), g_early.flatten())
+                if dot < 0:
+                    conflict_steps += 1
+                    denom_e = (g_early.flatten().norm() ** 2 + 1e-12)
+                    denom_a = (g_acc.flatten().norm() ** 2 + 1e-12)
+                    proj_acc = g_acc - pcgrad_partial * (dot / denom_e) * g_early
+                    if pcgrad_mode == 'symmetric':
+                        proj_early = g_early - pcgrad_partial * (dot / denom_a) * g_acc
+                    else:
+                        proj_early = g_early
+                    g_acc, g_early = proj_acc, proj_early
+                
+                # Stage 2: GDW magnitude balancing on (potentially projected) gradients
+                norm_acc = g_acc.view(g_acc.size(0), -1).norm(p=2, dim=1).mean()
+                norm_early = g_early.view(g_early.size(0), -1).norm(p=2, dim=1).mean()
+                
+                # Inverse norm weights: large gradient -> small weight
+                w_acc = 1.0 / (float(norm_acc) + float(gdw_eps))
+                w_early = 1.0 / (float(norm_early) + float(gdw_eps))
+                
+                # Normalize weights to sum to 2
+                w_sum = w_acc + w_early
+                if w_sum > 0:
+                    w_acc = (2.0 * w_acc) / w_sum
+                    w_early = (2.0 * w_early) / w_sum
+                
+                # Track weight ratio for diagnostics
+                gdw_weight_ratios.append(w_acc / max(w_early, 1e-12))
+                
+                grads = w_acc * g_acc + w_early * g_early + g_reg
+        elif pcgrad and early_losses:
             g_acc = torch.autograd.grad(loss_ce_term * lambda_ce, delta, retain_graph=True)[0]
             g_early = torch.autograd.grad(loss_early_total * lambda_earlyexits, delta, retain_graph=True)[0]
             g_reg = torch.autograd.grad(lambda_l2 * loss_l2_term, delta)[0]
@@ -530,6 +618,16 @@ def attack_batch(model, x, y, thresholds, eps, alpha, steps, lambda_exits, lambd
             delta_pix = delta
         linf = delta_pix.abs().view(batch_size, -1).max(dim=1)[0].cpu()
         l2 = delta_pix.view(batch_size, -1).norm(p=2, dim=1).cpu()
+    
+    # Diagnostic output if using PCGrad+GDW
+    if pcgrad and gdw and total_steps_checked > 0:
+        conflict_rate = conflict_steps / max(1, total_steps_checked)
+        if gdw_weight_ratios:
+            avg_ratio = sum(gdw_weight_ratios) / len(gdw_weight_ratios)
+            # Only print occasionally to avoid spam
+            if conflict_steps > 0:
+                pass  # Can enable for debugging: print(f"[Debug] Conflict rate: {conflict_rate:.2%}, GDW avg ratio: {avg_ratio:.3f}")
+    
     # Return conflict ratio (fraction of steps with conflicting gradients)
     return x_adv.detach(), linf, l2, preds_adv, exits_adv, (conflict_steps / max(1, steps)), snapshots_summary
 
@@ -773,6 +871,7 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
             pgd_update_mode=args.pgd_update_mode, pgd_momentum=args.pgd_momentum,
             auto_balance_early=args.auto_balance_early, ab_target_ratio=args.ab_target_ratio, grad_select=args.grad_select,
             gdw=args.gdw, gdw_eps=args.gdw_eps,
+            pcgrad_gdw_order=args.pcgrad_gdw_order,
             snapshot_every=int(getattr(args, 'snapshot_every', 0)) if hasattr(args, 'snapshot_every') else 0,
             snapshot_steps=[int(s) for s in sorted(list(snapshot_steps_set))] if snapshot_steps_set else None
         )
@@ -1162,16 +1261,18 @@ def main():
     parser.add_argument('--cw', action='store_true', default=False, help='使用 CW 风格保持正确 (默认 False=CE)')
     parser.add_argument('--c', type=float, default=0.1, help='CW 系数 c')
     parser.add_argument('--kappa', type=float, default=3, help='CW 置信度 margin')
-    parser.add_argument('--pcgrad', action='store_true', help='是否使用 PCGrad', default=False)
+    parser.add_argument('--pcgrad', action='store_true', help='是否使用 PCGrad', default=True)
     parser.add_argument('--pcgrad_mode', type=str, choices=['one-sided','symmetric'], default='symmetric', help='PCGrad 投影方式：单边/对称')
     parser.add_argument('--pcgrad_partial', type=float, default=1.0, help='PCGrad 投影强度比例 [0,1]，1为完全投影')
     parser.add_argument('--gradnorm', action='store_true', help='是否使用 GradNorm 解决多目标梯度冲突', default=False)
     parser.add_argument('--gradnorm_alpha', type=float, default=1.0, help='GradNorm 的 alpha 超参数')
     parser.add_argument('--gradnorm_lr', type=float, default=1e-3, help='GradNorm 中对权重 w 的学习率')
-    parser.add_argument('--gdw', action='store_true', help='是否使用 GDW (Gradient-magnitude based Dynamic Weighting) 平衡多目标梯度', default=False)
+    parser.add_argument('--gdw', action='store_true', help='是否使用 GDW (Gradient-magnitude based Dynamic Weighting) 平衡多目标梯度', default=True)
     parser.add_argument('--gdw_eps', type=float, default=1e-6, help='GDW 权重计算中的 epsilon (防止除零)')
+    parser.add_argument('--pcgrad_gdw_order', type=str, choices=['pcgrad_first', 'gdw_first'], default='gdw_first', 
+                        help='当同时使用PCGrad和GDW时的执行顺序：pcgrad_first=先投影再平衡(默认), gdw_first=先平衡再投影')
     parser.add_argument('--same_acc_early_loss_value', default=False, action='store_true', help='使用和原始示例相似的早期分支负交叉熵法')
-    parser.add_argument('--device', type=str, default='cuda:2', help='手动指定设备，如 cuda:0')
+    parser.add_argument('--device', type=str, default='cuda:5', help='手动指定设备，如 cuda:0')
     parser.add_argument('--only', nargs='*', help='仅评测这些模型名（可多个）')
     parser.add_argument('--skip', nargs='*', default=[], help='跳过这些模型名')
     parser.add_argument('--skip_contains', nargs='*', default=["cnn","cifar10", "training"], help='排除名字中包含这些子串的模型（多值 OR）')
