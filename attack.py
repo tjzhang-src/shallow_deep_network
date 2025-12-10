@@ -52,8 +52,66 @@ import matplotlib.pyplot as plt
 import network_architectures as arcs
 import aux_funcs as af
 import profiler as prof
+import numpy as np
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
+def compute_ssim(img1: torch.Tensor, img2: torch.Tensor, window_size: int = 11) -> float:
+    """计算结构相似度 (SSIM)，值越接近1表示图像越相似
+    
+    Args:
+        img1, img2: shape [C, H, W] 或 [B, C, H, W]，取值范围 [0, 1]
+        window_size: 高斯窗口大小
+    
+    Returns:
+        SSIM值，范围 [-1, 1]，通常在 [0, 1] 之间
+    """
+    C1 = (0.01) ** 2
+    C2 = (0.03) ** 2
+    
+    if img1.dim() == 3:
+        img1 = img1.unsqueeze(0)
+        img2 = img2.unsqueeze(0)
+    
+    # 创建高斯窗口
+    sigma = 1.5
+    gauss = torch.Tensor([math.exp(-(x - window_size//2)**2/float(2*sigma**2)) for x in range(window_size)])
+    _1D_window = (gauss/gauss.sum()).unsqueeze(1)
+    _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
+    window = _2D_window.expand(img1.size(1), 1, window_size, window_size).contiguous()
+    window = window.to(img1.device)
+    
+    mu1 = F.conv2d(img1, window, padding=window_size//2, groups=img1.size(1))
+    mu2 = F.conv2d(img2, window, padding=window_size//2, groups=img2.size(1))
+    
+    mu1_sq = mu1.pow(2)
+    mu2_sq = mu2.pow(2)
+    mu1_mu2 = mu1 * mu2
+    
+    sigma1_sq = F.conv2d(img1 * img1, window, padding=window_size//2, groups=img1.size(1)) - mu1_sq
+    sigma2_sq = F.conv2d(img2 * img2, window, padding=window_size//2, groups=img2.size(1)) - mu2_sq
+    sigma12 = F.conv2d(img1 * img2, window, padding=window_size//2, groups=img1.size(1)) - mu1_mu2
+    
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+    return ssim_map.mean().item()
+
+
+def compute_psnr(img1: torch.Tensor, img2: torch.Tensor, max_val: float = 1.0) -> float:
+    """计算峰值信噪比 (PSNR)，值越大表示图像质量越好
+    
+    Args:
+        img1, img2: 图像张量
+        max_val: 像素最大值，通常为1.0或255.0
+    
+    Returns:
+        PSNR值（dB），通常在 [20, 50] 之间，越大越好
+    """
+    mse = F.mse_loss(img1, img2)
+    if mse == 0:
+        return float('inf')
+    psnr = 20 * math.log10(max_val / math.sqrt(mse.item()))
+    return psnr
 
 
 def _compute_eec_score(exit_dist: List[int]) -> float:
@@ -219,6 +277,16 @@ def attack_batch(model, x, y, thresholds, eps, alpha, steps, lambda_exits, lambd
     batch_size = x.size(0)
     delta = torch.zeros_like(x, device=x.device, requires_grad=True)
     num_internal = model.num_output - 1 if hasattr(model, 'num_output') else 0
+    
+    # 获取干净样本的所有出口输出作为目标（用于保持输出一致性）
+    with torch.no_grad():
+        outputs_clean = model(x_orig)
+        if isinstance(outputs_clean, list):
+            internal_outputs_clean = [out.detach() for out in outputs_clean[:-1]]
+            final_out_clean = outputs_clean[-1].detach()
+        else:
+            internal_outputs_clean = []
+            final_out_clean = outputs_clean.detach()
 
     # Prepare normalization-aware bounds and step sizes (operate in normalized space)
     if norm_mean is None or norm_std is None:
@@ -287,9 +355,19 @@ def attack_batch(model, x, y, thresholds, eps, alpha, steps, lambda_exits, lambd
         # 计算早期熵损失
         early_losses = []
         if same_acc_early_loss:
+            # 使用 KL 散度让内部出口输出接近干净样本的输出
             for i, logits in enumerate(internal_outputs):
                 coef = 0.1 if i == 0 else 0.05
-                early_losses.append(-F.cross_entropy(logits, y) * coef)
+                if i < len(internal_outputs_clean):
+                    # 使用 KL 散度保持与干净样本输出一致
+                    loss_kl = F.kl_div(
+                        F.log_softmax(logits, dim=1),
+                        F.softmax(internal_outputs_clean[i], dim=1),
+                        reduction='batchmean'
+                    )
+                    early_losses.append(-loss_kl * coef)
+                else:
+                    early_losses.append(torch.zeros(1, device=logits.device, dtype=logits.dtype))
         else:
             # 若指定偏好出口，则将早期损失设置为：
             # - 对于 i < target: 提高熵，避免更早出口 -> hinge(t - nent, 0)
@@ -327,8 +405,16 @@ def attack_batch(model, x, y, thresholds, eps, alpha, steps, lambda_exits, lambd
                     # 前半部分低于阈值的出口：加大熵约束权重，防止过早退出
                     early_losses.append(adaptive_acc_weight * torch.clamp(t - nent, min=0.0).mean())
                 elif exit_idx in adaptive_late_exits:
-                    # 后半部分低于阈值的出口：维持该层精度
-                    early_losses.append(F.cross_entropy(logits, y) * adaptive_acc_weight)
+                    # 后半部分低于阈值的出口：维持该层输出与干净样本一致
+                    if i < len(internal_outputs_clean):
+                        loss_kl = F.kl_div(
+                            F.log_softmax(logits, dim=1),
+                            F.softmax(internal_outputs_clean[i], dim=1),
+                            reduction='batchmean'
+                        )
+                        early_losses.append(loss_kl * adaptive_acc_weight + adaptive_acc_weight * torch.clamp(t - nent, min=0.0).mean())
+                    else:
+                        early_losses.append(adaptive_acc_weight * torch.clamp(t - nent, min=0.0).mean())
                 elif target is None:
                     # 默认策略：整体提高早期熵，推动更晚退出
                     early_losses.append(torch.clamp(t - nent, min=0.0).mean())
@@ -352,8 +438,9 @@ def attack_batch(model, x, y, thresholds, eps, alpha, steps, lambda_exits, lambd
         else:
             loss_early_total = torch.zeros(1, device=final_out.device, dtype=final_out.dtype)
 
-    # 最终输出保持正确 (CW 或 CE)
+    # 最终输出保持与干净样本一致（使用 KL 散度）
         if cw:
+            # CW 模式保持原有逻辑（相对于真实标签）
             batch_indices = torch.arange(batch_size, device=final_out.device)
             target_logit = final_out[batch_indices, y]
             mask = torch.nn.functional.one_hot(y, num_classes=final_out.size(1)).bool()
@@ -361,7 +448,13 @@ def attack_batch(model, x, y, thresholds, eps, alpha, steps, lambda_exits, lambd
             f = torch.clamp(other_logit - target_logit + kappa, min=0.0)
             loss_ce_term = f.mean() * c
         else:
-            loss_ce_term = F.cross_entropy(final_out, y)
+            # 使用 KL 散度让对抗样本的输出分布接近干净样本的输出分布
+            # KL(clean || adv) = sum(p_clean * (log p_clean - log p_adv))
+            loss_ce_term = F.kl_div(
+                F.log_softmax(final_out, dim=1),
+                F.softmax(final_out_clean, dim=1),
+                reduction='batchmean'
+            )
 
         loss_l2_term = (delta.view(batch_size, -1).norm(p=2, dim=1).mean())
 
@@ -698,7 +791,7 @@ def list_candidate_model_names(models_path: str) -> List[str]:
     return valid
 
 
-def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
+def evaluate_one_model(models_path: str, model_name: str, args, attack_all_samples: bool = False, attack_exit_strategy=None) -> dict:
     """评测单个模型并返回记录。"""
     # 加载模型
     model, params = arcs.load_model(models_path, model_name, epoch=-1)
@@ -708,6 +801,13 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
 
     # 数据集（与训练一致）
     task = params.get('task', args.dataset)
+    
+    # 警告：如果命令行指定的dataset与模型训练的task不一致
+    if 'task' in params and args.dataset and params['task'] != args.dataset:
+        print(f"\n⚠️  WARNING: Model was trained on '{params['task']}' but you specified '--dataset {args.dataset}'")
+        print(f"    Using model's original task: '{task}'")
+        print(f"    Model may fail if dataset classes don't match!\n")
+    
     dataset = af.get_dataset(task, batch_size=args.batch_size)
     if dataset is None or not hasattr(dataset, 'test_loader'):
         # 兜底：直接调用具体加载函数
@@ -764,6 +864,11 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
     # Maximum confidence trackers (for chosen exits)
     maxconf_clean: List[float] = []
     maxconf_adv: List[float] = []
+    
+    # 图像质量指标（感知相似度评估）
+    ssim_values: List[float] = []  # 结构相似度
+    psnr_values: List[float] = []  # 峰值信噪比
+    pixel_change_rate: List[float] = []  # 像素改变比例
 
     pbar = tqdm.tqdm(testloader, desc=f"{model_name}")
     # Pre-compute per-exit FLOPs (cumulative) using profiler if available
@@ -847,7 +952,32 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
             idx = int(e.item()) if num_internal > 0 else 1
             exit_counts_clean[idx] += 1
 
-        if correct_mask.sum().item() == 0:
+        # 决定攻击哪些样本
+        if attack_all_samples:
+            # 策略1: 攻击所有样本（不管是否正确分类）
+            attack_mask = torch.ones(batch_size, dtype=torch.bool).cpu()
+        elif attack_exit_strategy is not None:
+            # 策略2: 攻击从特定出口退出且该出口能正确分类的样本
+            attack_mask = torch.zeros(batch_size, dtype=torch.bool).cpu()
+            for i in range(batch_size):
+                exit_id = int(exits_clean[i].item())
+                # 该样本从 exit_id 退出，检查该出口的预测是否正确
+                exit_pred_correct = (preds_clean[i] == labels[i].cpu()).item()
+                
+                if attack_exit_strategy == 'any_exit':
+                    # 从任意出口退出且该出口预测正确的样本
+                    attack_mask[i] = exit_pred_correct
+                elif attack_exit_strategy == 'early_exits':
+                    # 从早期出口(非最终层)退出且该出口预测正确的样本
+                    attack_mask[i] = exit_pred_correct and (exit_id <= num_internal)
+                elif isinstance(attack_exit_strategy, int):
+                    # 从指定出口退出且该出口预测正确的样本
+                    attack_mask[i] = exit_pred_correct and (exit_id == attack_exit_strategy)
+        else:
+            # 策略3(默认): 只攻击最终层能正确分类的样本
+            attack_mask = correct_mask
+
+        if attack_mask.sum().item() == 0:
             for e in exits_clean:
                 idx = int(e.item()) if num_internal > 0 else 1
                 exit_counts_adv[idx] += 1
@@ -866,9 +996,9 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
             pbar.set_postfix(clean_acc=f"{correct_clean/max(1,total):.4f}", adv_acc=f"{correct_adv/max(1,total):.4f}")
             continue
 
-        mask_idx = torch.nonzero(correct_mask, as_tuple=False).squeeze(1).to(device)
-        imgs_correct = imgs[mask_idx]
-        labels_correct = labels[mask_idx]
+        mask_idx = torch.nonzero(attack_mask, as_tuple=False).squeeze(1).to(device)
+        imgs_to_attack = imgs[mask_idx]
+        labels_to_attack = labels[mask_idx]
 
         # Gather clean energy for attacked subset (for global ratio denominator)
         if ops_per_exit is not None:
@@ -892,7 +1022,7 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
                 batch_clean_den_pj = e_sum_b / float(batch_attacked_num)
 
         x_adv_subset, linf_vals, l2_vals, preds_adv_subset, exits_adv_subset, conflict_ratio, snapshots_summary = attack_batch(
-            model, imgs_correct, labels_correct,
+            model, imgs_to_attack, labels_to_attack,
             entropy_thresholds, eps, alpha, args.pgd_steps,
             lambda_exits,args.lambda_earlyexits, args.lambda_ce, args.lambda_l2,
             cw=args.cw, c=args.c, kappa=args.kappa, pcgrad=args.pcgrad,
@@ -913,12 +1043,42 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
             snapshot_steps=[int(s) for s in sorted(list(snapshot_steps_set))] if snapshot_steps_set else None
         )
         # Weight by number of attacked samples in this batch
-        attacked_count = imgs_correct.size(0)
+        attacked_count = imgs_to_attack.size(0)
         pc_conflict_fraction += float(conflict_ratio) * attacked_count
         pc_conflict_weight += attacked_count
 
         imgs_adv = imgs.clone()
         imgs_adv[mask_idx] = x_adv_subset
+        
+        # 计算图像质量指标（针对被攻击的样本）
+        if mask_idx.numel() > 0:
+            # 反归一化到 [0, 1] 范围（如果需要）
+            imgs_clean_subset = imgs[mask_idx]
+            imgs_adv_subset = imgs_adv[mask_idx]
+            
+            # 计算 SSIM
+            try:
+                ssim_batch = compute_ssim(imgs_clean_subset, imgs_adv_subset)
+                ssim_values.append(ssim_batch)
+            except Exception:
+                pass
+            
+            # 计算 PSNR
+            try:
+                psnr_batch = compute_psnr(imgs_clean_subset, imgs_adv_subset, max_val=1.0)
+                psnr_values.append(psnr_batch)
+            except Exception:
+                pass
+            
+            # 计算像素改变比例（threshold > 1/255）
+            try:
+                pixel_diff = torch.abs(imgs_clean_subset - imgs_adv_subset)
+                changed_pixels = (pixel_diff > 1.0/255.0).float().mean().item()
+                pixel_change_rate.append(changed_pixels * 100.0)  # 百分比
+            except Exception:
+                pass
+        
+        # Rest of the code...
         with torch.no_grad():
             outputs_adv = model.forward(imgs_adv)
             if num_internal > 0:
@@ -1081,6 +1241,10 @@ def evaluate_one_model(models_path: str, model_name: str, args) -> dict:
         'preferred_exit': int(args.prefer_exit) if args.prefer_exit is not None else None,
         'gradnorm': bool(args.gradnorm),
         'gdw': bool(args.gdw),
+        # 图像质量指标（感知相似度）
+        'avg_ssim': (sum(ssim_values)/len(ssim_values)) if ssim_values else 0.0,
+        'avg_psnr': (sum(psnr_values)/len(psnr_values)) if psnr_values else 0.0,
+        'avg_pixel_change_rate': (sum(pixel_change_rate)/len(pixel_change_rate)) if pixel_change_rate else 0.0,
         # EEC and curve distances
         'eec_clean': eec_clean,
         'eec_adv': eec_adv,
@@ -1225,6 +1389,8 @@ def save_attack_summary(records: List[dict], out_dir='outputs/test_results'):
         'avg_blocks_clean','avg_blocks_adv',
         # Confidence stats
         'maxconf_clean_mean','maxconf_adv_mean',
+        # 图像质量指标
+        'avg_ssim','avg_psnr','avg_pixel_change_rate',
         'snapshot_energy_acc_points','acc_vs_energy_png',
         'preferred_exit','gradnorm','gdw'
     ]
@@ -1263,6 +1429,11 @@ def save_attack_summary(records: List[dict], out_dir='outputs/test_results'):
             f.write(f"  - Early-exit curve distances (Haus/SSPD): {r.get('haus_exitcdf',0.0):.4f} / {r.get('sspd_exitcdf',0.0):.4f}\n")
             f.write(f"  - Avg blocks (SDN layers) clean/adv: {r.get('avg_blocks_clean',0.0):.2f} / {r.get('avg_blocks_adv',0.0):.2f}\n")
             f.write(f"  - Max confidence mean (clean/adv): {r.get('maxconf_clean_mean',0.0):.4f} / {r.get('maxconf_adv_mean',0.0):.4f}\n")
+            # 图像质量指标
+            f.write(f"  - **Image Quality Metrics (Perceptual Similarity)**:\n")
+            f.write(f"    - SSIM (Structural Similarity): {r.get('avg_ssim',0.0):.4f} (1.0 = identical)\n")
+            f.write(f"    - PSNR (Peak Signal-to-Noise Ratio): {r.get('avg_psnr',0.0):.2f} dB (higher = better)\n")
+            f.write(f"    - Pixel Change Rate: {r.get('avg_pixel_change_rate',0.0):.2f}%\n")
             snaps = r.get('snapshot_energy_acc_points', []) or []
             if snaps:
                 f.write("  - Snapshot energy-ratio vs adv-acc points (step:ratio->acc%):\n")
@@ -1294,7 +1465,7 @@ def main():
     parser.add_argument('--lambda_l2', type=float, default=0.01)
     parser.add_argument('--eps', type=str, default='8/255')
     parser.add_argument('--alpha', type=str, default='2/255')
-    parser.add_argument('--pgd_steps', type=int, default=40)
+    parser.add_argument('--pgd_steps', type=int, default=20)
     parser.add_argument('--cw', action='store_true', default=False, help='使用 CW 风格保持正确 (默认 False=CE)')
     parser.add_argument('--c', type=float, default=0.1, help='CW 系数 c')
     parser.add_argument('--kappa', type=float, default=3, help='CW 置信度 margin')
@@ -1309,10 +1480,10 @@ def main():
     parser.add_argument('--pcgrad_gdw_order', type=str, choices=['pcgrad_first', 'gdw_first'], default='gdw_first', 
                         help='当同时使用PCGrad和GDW时的执行顺序：pcgrad_first=先投影再平衡(默认), gdw_first=先平衡再投影')
     parser.add_argument('--same_acc_early_loss_value', default=False, action='store_true', help='使用和原始示例相似的早期分支负交叉熵法')
-    parser.add_argument('--device', type=str, default='cuda:1', help='手动指定设备，如 cuda:0')
+    parser.add_argument('--device', type=str, default='cuda:2', help='手动指定设备，如 cuda:0')
     parser.add_argument('--only', nargs='*', help='仅评测这些模型名（可多个）')
     parser.add_argument('--skip', nargs='*', default=[], help='跳过这些模型名')
-    parser.add_argument('--skip_contains', nargs='*', default=["cnn","cifar10_","imagenet", "training"], help='排除名字中包含这些子串的模型（多值 OR）')
+    parser.add_argument('--skip_contains', nargs='*', default=["cnn","cifar10", "training"], help='排除名字中包含这些子串的模型（多值 OR）')
     parser.add_argument('--pre_target_margin', type=float, default=0.1, help='在目标出口之前的层，额外增加的熵阈值裕量 (默认0不启用)')
     parser.add_argument('--pre_target_weight', type=float, default=1.0, help='目标之前层的约束权重(乘子)')
     parser.add_argument('--prefer_exit', type=int, default=0, help='攻击时倾向让样本在该出口退出（1..N；N为最终出口）')
@@ -1326,22 +1497,32 @@ def main():
                         help='梯度合成方式：none=加和(默认，可配合auto_balance_early)；max_norm=在两者中选择范数更大的；max_element=逐元素选择绝对值更大的。')
     parser.add_argument('--snapshot_every', type=int, default=4, help='PGD 步长间隔进行一次快照 (能耗/精度)，0=禁用')
     parser.add_argument('--snapshot_steps', type=str, default=None, help='逗号分隔的具体 PGD 步编号(1-based)进行快照，优先级高于 snapshot_every')
-    parser.add_argument('--adaptive_exit_strategy', action='store_true', default=False, 
+    parser.add_argument('--adaptive_exit_strategy', action='store_true', default=True, 
                         help='启用自适应出口策略：在最后1/4的PGD步骤中检测对抗样本想要使用的早退层，对该层使用精度约束而非熵约束')
     parser.add_argument('--adaptive_start_ratio', type=float, default=0.85, 
                         help='自适应策略开始的步骤比例 (默认0.75，即最后25%的步骤)')
     parser.add_argument('--adaptive_acc_weight', type=float, default=1.0, 
                         help='自适应策略中精度约束的权重系数')
+    parser.add_argument('--attack_all_samples', action='store_true', default=False,
+                        help='策略1: 攻击所有样本（包括模型错误分类的），默认False只攻击正确分类的样本')
+    parser.add_argument('--attack_exit_strategy', type=str, default="any_exit",
+                        choices=['any_exit', 'early_exits'],
+                        help='策略2: any_exit=从任意出口退出且该出口正确的样本, early_exits=从早期出口退出且该出口正确的样本')
+    parser.add_argument('--attack_specific_exit', type=int, default=None,
+                        help='策略2变体: 攻击从指定出口(1-based)退出且该出口正确的样本，覆盖attack_exit_strategy')
     args = parser.parse_args()
 
     global device
     if args.device:
         device = torch.device(args.device)
+    
+    # 确定攻击策略
+    attack_exit_strategy = args.attack_specific_exit if args.attack_specific_exit is not None else args.attack_exit_strategy
 
     # 单模型或批量评测
     records: List[dict] = []
     if args.model_name:
-        rec = evaluate_one_model(args.models_path, args.model_name, args)
+        rec = evaluate_one_model(args.models_path, args.model_name, args, attack_all_samples=args.attack_all_samples, attack_exit_strategy=attack_exit_strategy)
         records.append(rec)
     else:
         all_names = list_candidate_model_names(args.models_path)
@@ -1364,7 +1545,7 @@ def main():
         for n in names:
             print(' -', n)
         for n in names:
-            rec = evaluate_one_model(args.models_path, n, args)
+            rec = evaluate_one_model(args.models_path, n, args, attack_all_samples=args.attack_all_samples, attack_exit_strategy=attack_exit_strategy)
             records.append(rec)
 
     if records:
