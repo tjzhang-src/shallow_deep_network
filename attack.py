@@ -1486,7 +1486,7 @@ def main():
     parser.add_argument('--skip_contains', nargs='*', default=["cnn","cifar10", "training"], help='排除名字中包含这些子串的模型（多值 OR）')
     parser.add_argument('--pre_target_margin', type=float, default=0.1, help='在目标出口之前的层，额外增加的熵阈值裕量 (默认0不启用)')
     parser.add_argument('--pre_target_weight', type=float, default=1.0, help='目标之前层的约束权重(乘子)')
-    parser.add_argument('--prefer_exit', type=int, default=0, help='攻击时倾向让样本在该出口退出（1..N；N为最终出口）')
+    parser.add_argument('--prefer_exit', type=int, default=7, help='攻击时倾向让样本在该出口退出（1..N；N为最终出口）')
     parser.add_argument('--out_dir', type=str, default='outputs/test_results', help='导出结果目录')
     # PGD update options
     parser.add_argument('--pgd_update_mode', type=str, choices=['linf_sign','l2_dir','linf_projected_dir'], default='l2_dir', help='PGD 更新方向：Linf-sign 或 L2 方向（保留Linf投影）')
@@ -1495,9 +1495,9 @@ def main():
     parser.add_argument('--ab_target_ratio', type=float, default=1.0, help='自适应缩放目标：||g_early|| ≈ ab_target_ratio * ||g_acc||')
     parser.add_argument('--grad_select', type=str, choices=['none','max_norm','max_element'], default='none',
                         help='梯度合成方式：none=加和(默认，可配合auto_balance_early)；max_norm=在两者中选择范数更大的；max_element=逐元素选择绝对值更大的。')
-    parser.add_argument('--snapshot_every', type=int, default=4, help='PGD 步长间隔进行一次快照 (能耗/精度)，0=禁用')
+    parser.add_argument('--snapshot_every', type=int, default=1, help='PGD 步长间隔进行一次快照 (能耗/精度)，0=禁用')
     parser.add_argument('--snapshot_steps', type=str, default=None, help='逗号分隔的具体 PGD 步编号(1-based)进行快照，优先级高于 snapshot_every')
-    parser.add_argument('--adaptive_exit_strategy', action='store_true', default=True, 
+    parser.add_argument('--adaptive_exit_strategy', action='store_true', default=False, 
                         help='启用自适应出口策略：在最后1/4的PGD步骤中检测对抗样本想要使用的早退层，对该层使用精度约束而非熵约束')
     parser.add_argument('--adaptive_start_ratio', type=float, default=0.85, 
                         help='自适应策略开始的步骤比例 (默认0.75，即最后25%的步骤)')
@@ -1505,7 +1505,7 @@ def main():
                         help='自适应策略中精度约束的权重系数')
     parser.add_argument('--attack_all_samples', action='store_true', default=False,
                         help='策略1: 攻击所有样本（包括模型错误分类的），默认False只攻击正确分类的样本')
-    parser.add_argument('--attack_exit_strategy', type=str, default="any_exit",
+    parser.add_argument('--attack_exit_strategy', type=str, default=None,
                         choices=['any_exit', 'early_exits'],
                         help='策略2: any_exit=从任意出口退出且该出口正确的样本, early_exits=从早期出口退出且该出口正确的样本')
     parser.add_argument('--attack_specific_exit', type=int, default=None,
