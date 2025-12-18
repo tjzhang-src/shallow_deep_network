@@ -1486,7 +1486,7 @@ def main():
     parser.add_argument('--skip_contains', nargs='*', default=["cnn","cifar10_","imagenet", "train"], help='排除名字中包含这些子串的模型（多值 OR）')
     parser.add_argument('--pre_target_margin', type=float, default=0.1, help='在目标出口之前的层，额外增加的熵阈值裕量 (默认0不启用)')
     parser.add_argument('--pre_target_weight', type=float, default=1.0, help='目标之前层的约束权重(乘子)')
-    parser.add_argument('--prefer_exit', type=int, default=0, help='攻击时倾向让样本在该出口退出（1..N；N为最终出口）')
+    parser.add_argument('--prefer_exit', type=int, default=7, help='攻击时倾向让样本在该出口退出（1..N；N为最终出口）')
     parser.add_argument('--out_dir', type=str, default='outputs/test_results', help='导出结果目录')
     # PGD update options
     parser.add_argument('--pgd_update_mode', type=str, choices=['linf_sign','l2_dir','linf_projected_dir'], default='l2_dir', help='PGD 更新方向：Linf-sign 或 L2 方向（保留Linf投影）')
