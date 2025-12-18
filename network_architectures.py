@@ -331,7 +331,9 @@ def load_model(models_path, model_name, epoch=0):
     else:
         load_path = network_path + '/' + str(epoch)
 
-    model.load_state_dict(torch.load(load_path), strict=False)
+    # Load model with map_location to handle device mismatch
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.load_state_dict(torch.load(load_path, map_location=device), strict=False)
 
     return model, model_params
 
