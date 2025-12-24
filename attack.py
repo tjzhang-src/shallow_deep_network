@@ -54,7 +54,33 @@ import aux_funcs as af
 import profiler as prof
 import numpy as np
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+def _resolve_device(preferred: Optional[str] = None) -> torch.device:
+    """Pick a safe device, falling back to CPU if CUDA init fails."""
+    # Explicit CLI preference wins unless CUDA init throws
+    if preferred:
+        dev = torch.device(preferred)
+        if dev.type == 'cuda':
+            try:
+                _ = torch.cuda.device_count()
+                if torch.cuda.is_available():
+                    return dev
+            except Exception as e:
+                print(f"⚠️  CUDA unavailable ({e}); falling back to CPU")
+            return torch.device('cpu')
+        return dev
+
+    # Auto-pick: try CUDA, otherwise CPU
+    try:
+        if torch.cuda.is_available():
+            _ = torch.cuda.device_count()
+            return torch.device('cuda:0')
+    except Exception as e:
+        print(f"⚠️  CUDA unavailable ({e}); falling back to CPU")
+    return torch.device('cpu')
+
+
+device = _resolve_device()
 
 
 def compute_ssim(img1: torch.Tensor, img2: torch.Tensor, window_size: int = 11) -> float:
@@ -705,13 +731,13 @@ def attack_batch(model, x, y, thresholds, eps, alpha, steps, lambda_exits, lambd
                 snap_outs = model.forward(x_snap)
                 if isinstance(snap_outs, list):
                     preds_s, exits_s = select_exits(snap_outs, thresholds)
-                    final_out_s = snap_outs[-1]
+                    # Accuracy should be measured at the actually chosen exit
+                    correct_s = int((preds_s == y.cpu()).sum().item())
                 else:
                     preds_s = snap_outs.argmax(dim=1).cpu()
                     exits_s = torch.full((batch_size,), 1, dtype=torch.long)
-                    final_out_s = snap_outs
-                final_pred_s = final_out_s.argmax(dim=1)
-                correct_s = int((final_pred_s == y).sum().item())
+                    # No internal exits: accuracy equals final prediction
+                    correct_s = int((preds_s == y.cpu()).sum().item())
                 # build exit counts vector length = num_internal+1
                 num_internal_local = model.num_output - 1 if hasattr(model, 'num_output') else 0
                 counts = [0] * (num_internal_local + 1)
@@ -1351,7 +1377,7 @@ def evaluate_one_model(models_path: str, model_name: str, args, attack_all_sampl
             if xs_m:
                 plt.plot(xs_m, ys_m, '-o', color='#d62728', linewidth=2, markersize=4, label='step mean')
             # baseline clean point
-            plt.scatter([1.0], [rec['clean_final_acc']], color='#2ca02c', s=30, label='clean (x=1)')
+            plt.scatter([1.0], [rec['clean_final_acc']], color="#10CC10", s=30, label='clean (x=1)')
             plt.xlabel('Relative energy (adv / clean)')
             plt.ylabel('Accuracy (%)')
             plt.title(f"{model_name}: Acc vs Relative Energy")
@@ -1497,7 +1523,7 @@ def main():
                         help='梯度合成方式：none=加和(默认，可配合auto_balance_early)；max_norm=在两者中选择范数更大的；max_element=逐元素选择绝对值更大的。')
     parser.add_argument('--snapshot_every', type=int, default=1, help='PGD 步长间隔进行一次快照 (能耗/精度)，0=禁用')
     parser.add_argument('--snapshot_steps', type=str, default=None, help='逗号分隔的具体 PGD 步编号(1-based)进行快照，优先级高于 snapshot_every')
-    parser.add_argument('--adaptive_exit_strategy', action='store_true', default=False, 
+    parser.add_argument('--adaptive_exit_strategy', action='store_true', default=True, 
                         help='启用自适应出口策略：在最后1/4的PGD步骤中检测对抗样本想要使用的早退层，对该层使用精度约束而非熵约束')
     parser.add_argument('--adaptive_start_ratio', type=float, default=0.85, 
                         help='自适应策略开始的步骤比例 (默认0.75，即最后25%的步骤)')
@@ -1505,7 +1531,7 @@ def main():
                         help='自适应策略中精度约束的权重系数')
     parser.add_argument('--attack_all_samples', action='store_true', default=False,
                         help='策略1: 攻击所有样本（包括模型错误分类的），默认False只攻击正确分类的样本')
-    parser.add_argument('--attack_exit_strategy', type=str, default=None,
+    parser.add_argument('--attack_exit_strategy', type=str, default="any_exit",
                         choices=['any_exit', 'early_exits'],
                         help='策略2: any_exit=从任意出口退出且该出口正确的样本, early_exits=从早期出口退出且该出口正确的样本')
     parser.add_argument('--attack_specific_exit', type=int, default=None,
@@ -1514,7 +1540,7 @@ def main():
 
     global device
     if args.device:
-        device = torch.device(args.device)
+        device = _resolve_device(args.device)
     
     # 确定攻击策略
     attack_exit_strategy = args.attack_specific_exit if args.attack_specific_exit is not None else args.attack_exit_strategy
